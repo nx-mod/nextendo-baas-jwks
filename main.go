@@ -55,7 +55,11 @@ func main() {
 	key := getenv("KEY_FILE", "/certs/key.pem")
 	addr := getenv("BAAS_PORT", ":443")
 	keyPath := getenv("BAAS_SIGNING_KEY", "/app/baas_signing_key.pem")
-	kid := getenv("BAAS_KID", "baas-key-1")
+	// kid = key identifier — MUST match the `kid` field in the BAAS id_token that
+	// Ryujinx-Nextendo signs (ManagerServer.cs hardcodes "nextendo-baas-key-1").
+	// A mismatch → the Switch fetches the JWKS but cannot find the right key by kid
+	// → token verification fails → error 2124-3121 on new account login.
+	kid := getenv("BAAS_KID", "nextendo-baas-key-1")
 	jwksPath := getenv("BAAS_JWKS_PATH", "/1.0.0/certificates")
 	// Kids DISTINCTS par émetteur pour l'import Switch (la console lie kid<->issuer et rejette
 	// à l'import si un même kid sert accounts ET baas). On publie la MÊME clé RSA sous plusieurs
