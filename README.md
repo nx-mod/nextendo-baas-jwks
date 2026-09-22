@@ -14,11 +14,11 @@ account (BAAS) `id_token` before allowing online entry: they fetch the JSON Web 
 token's `jku` URL and check the RS256 signature against the matching public key.
 
 **baas-jwks** answers that fetch. It publishes the **public** JWK derived from the RSA key the client
-signs its `id_token` with (the `kid` matches the token header). It ships **no private key** — the
+signs its `id_token` with (the `kid` matches the token header). It ships **no private key**: the
 signing key is supplied to the signer separately, at runtime. Every other path is logged and 404'd.
 
 Configuration is through environment variables; no secrets or infrastructure addresses are baked in.
 
 ## License
 
-Released under the **[PolyForm Shield License 1.0.0](LICENSE.md)** — source-available.
+Released under the **[PolyForm Shield License 1.0.0](LICENSE.md)**, source-available.
