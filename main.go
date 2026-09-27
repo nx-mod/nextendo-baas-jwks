@@ -11,12 +11,14 @@ package main
 
 import (
 	"crypto"
+	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -24,8 +26,11 @@ import (
 	"log"
 	"math/big"
 	"net/http"
+	"net/url"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -64,6 +69,113 @@ func loadPrivateKey(path string) *rsa.PrivateKey {
 	return nil
 }
 
+// The Nextendo secret (hex, NEXTENDO_SECRET_FILE), shared with nextendo-account and the game servers: it
+// signs the "nx2." identity in a login's idToken, as nextendo-account's signNexToken does.
+var nextendoSecret = func() []byte {
+	b, err := os.ReadFile(getenv("NEXTENDO_SECRET_FILE", "nextendo_secret.key"))
+	if err != nil {
+		return nil
+	}
+	dec, err := hex.DecodeString(strings.TrimSpace(string(b)))
+	if err != nil || len(dec) < 16 {
+		return nil
+	}
+	return dec
+}()
+
+func signNex(pid uint64, name string) string {
+	if len(nextendoSecret) == 0 {
+		return ""
+	}
+	payload := fmt.Sprintf("%d.%s.%d", pid, name, time.Now().Add(30*24*time.Hour).Unix())
+	mac := hmac.New(sha256.New, nextendoSecret)
+	mac.Write([]byte("nex:" + payload))
+	return "nx2." + base64.RawURLEncoding.EncodeToString([]byte(payload)) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+// BaaS users: a device account (what a console logs in with) belongs to a user (its NSA id, which the
+// console stored when it registered and checks against every login reply). Kept in BAAS_USERS_FILE:
+//
+//	{"<device account id>": {"user": "<user id>", "na": "<Nintendo Account id>", "password": "..."}}
+//
+// A console registered elsewhere (production) is added by hand with the ids its old login replies show.
+type baasUser struct {
+	User     string `json:"user"`
+	NA       string `json:"na,omitempty"`
+	Password string `json:"password,omitempty"`
+}
+
+var (
+	baasUsersMu sync.Mutex
+	baasUsers   = map[string]baasUser{}
+)
+
+func baasUsersPath() string { return getenv("BAAS_USERS_FILE", "baas_users.json") }
+
+func loadBaasUsers() {
+	b, err := os.ReadFile(baasUsersPath())
+	if err == nil {
+		json.Unmarshal(b, &baasUsers)
+	}
+	log.Printf("[baas-jwks] %d BaaS users (%s)", len(baasUsers), baasUsersPath())
+}
+
+func saveBaasUsersLocked() {
+	b, _ := json.MarshalIndent(baasUsers, "", "  ")
+	os.WriteFile(baasUsersPath(), b, 0o600)
+}
+
+// baasUserInfo is a user in production's shape (login and registration replies).
+func baasUserInfo(userID, deviceID, naID, nickname string, now int64) map[string]any {
+	links := map[string]any{
+		"friendCode": map[string]any{"id": "", "regenerable": false, "regenerableAt": 0, "createdAt": now, "updatedAt": now},
+	}
+	if naID != "" {
+		links["nintendoAccount"] = map[string]any{"id": naID, "createdAt": 1550779713, "updatedAt": 1550779713}
+	}
+	perm := map[string]any{"friendRequestReception": true, "friends": "EVERYONE", "presence": "FRIENDS",
+		"personalAnalytics": true, "personalNotification": true,
+		"presenceUpdatedAt": now, "personalAnalyticsUpdatedAt": now, "personalNotificationUpdatedAt": now}
+	extras := map[string]any{"self": map[string]any{"playLog": ""}, "favoriteFriends": map[string]any{"playLog": ""},
+		"friends": map[string]any{"playLog": ""}, "foaf": map[string]any{"playLog": ""}, "everyone": map[string]any{"playLog": ""}}
+	return map[string]any{
+		"id": userID, "etag": fmt.Sprintf("\"%s\"", randHex(8)), "nickname": nickname, "nicknameUpdatedAt": now,
+		"country": "", "birthday": "0000-00-00", "thumbnailUrl": "", "thumbnail2Url": "", "thumbnailUploadedAt": 0,
+		"deviceAccounts": []map[string]any{{"id": deviceID}}, "links": links, "permissions": perm, "extras": extras,
+		"deleted": false, "blocksUpdatedAt": now, "friendsUpdatedAt": now, "createdAt": now, "updatedAt": now,
+	}
+}
+
+func randHex(n int) string {
+	b := make([]byte, n)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// nextendoAccountFor maps a BaaS user id (16 hex digits) to its Nextendo account through nextendo-account's
+// /api/nsa, which takes the id in decimal. 0 if there is none.
+func nextendoAccountFor(userID string) (uint64, string) {
+	n, err := strconv.ParseUint(userID, 16, 64)
+	if err != nil {
+		return 0, ""
+	}
+	resp, err := http.Get(getenv("BAAS_ACCOUNT_URL", "http://127.0.0.1:8080") + "/api/nsa?id=" + strconv.FormatUint(n, 10))
+	if err != nil {
+		log.Printf("[baas-jwks] /api/nsa: %v", err)
+		return 0, ""
+	}
+	defer resp.Body.Close()
+	var out struct {
+		PID  uint64 `json:"pid"`
+		Name string `json:"name"`
+	}
+	if resp.StatusCode != http.StatusOK || json.NewDecoder(resp.Body).Decode(&out) != nil {
+		log.Printf("[baas-jwks] /api/nsa for %s: status %d", userID, resp.StatusCode)
+		return 0, ""
+	}
+	return out.PID, out.Name
+}
+
 func main() {
 	cert := getenv("CERT_FILE", "/certs/cert.pem")
 	key := getenv("KEY_FILE", "/certs/key.pem")
@@ -82,6 +194,7 @@ func main() {
 	kidBaasAccess := getenv("BAAS_ACCESS_KID", "00000000-0000-0000-0000-000000000003")
 	jwksPath := getenv("BAAS_JWKS_PATH", "/1.0.0/certificates")
 
+	loadBaasUsers()
 	priv := loadPrivateKey(keyPath)
 	pub := &priv.PublicKey
 	eBytes := big.NewInt(int64(pub.E)).Bytes()
@@ -148,6 +261,122 @@ func main() {
 		isToken := strings.Contains(r.URL.Path, "application/token") ||
 			strings.HasSuffix(r.URL.Path, "/token") || r.URL.Path == "/token"
 
+		// POST /1.0.0/login (and /1.0.0/federation, the same plus a Nintendo Account id token): the user's
+		// session, and the idToken a game hands to its own servers. The console logs in with the device
+		// account it registered; that id is used as the user id, mapped to a Nextendo account through
+		// nextendo-account's /api/nsa (which creates one in local open mode). The idToken carries the
+		// signed "nnex" identity the Nextendo game servers read (Diablo III's gates.go).
+		// What the account and friends sysmodules call after login, in production's shapes (taken from the
+		// baas-proxy log of a console on real Nextendo): the user itself, the devices snapshot, and lists.
+		w.Header().Set("Cache-Control", "no-store, no-cache")
+		emptyList := map[string]any{"count": 0, "etag": "", "items": []any{}, "itemsPerPage": 0}
+		p := r.URL.Path
+		if r.Method == http.MethodPost && p == "/1.0.0/devices/snapshot" {
+			var in struct {
+				UserIDs []string `json:"userIds"`
+			}
+			body, _ := io.ReadAll(r.Body)
+			json.Unmarshal(body, &in)
+			if in.UserIDs == nil {
+				in.UserIDs = []string{}
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"deletedUserIds": []string{}, "persistentUserIds": in.UserIDs})
+			return
+		}
+		if seg := strings.Split(strings.Trim(p, "/"), "/"); len(seg) >= 3 && seg[1] == "users" && len(seg[2]) == 16 {
+			userID := strings.ToLower(seg[2])
+			if len(seg) == 3 && seg[0] == "1.0.0" && (r.Method == http.MethodGet || r.Method == http.MethodPatch) {
+				deviceID, naID := "", ""
+				baasUsersMu.Lock()
+				for d, u := range baasUsers {
+					if u.User == userID {
+						deviceID, naID = d, u.NA
+					}
+				}
+				baasUsersMu.Unlock()
+				_, name := nextendoAccountFor(userID)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(baasUserInfo(userID, deviceID, naID, name, time.Now().Unix()))
+				return
+			}
+			if r.Method == http.MethodGet { // blocks, friends, friend_requests/inbox, ...: nothing yet
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(emptyList)
+				return
+			}
+		}
+		if r.Method == http.MethodGet && p == "/1.0.0/users" {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(emptyList)
+			return
+		}
+
+		// POST /1.0.0/users: a console registers a new user; it gets a device account with a password,
+		// which it keeps and logs in with from then on (201, user info with the password shown once).
+		if r.Method == http.MethodPost && r.URL.Path == "/1.0.0/users" {
+			deviceID, userID, pw := randHex(8), randHex(8), randHex(20)
+			baasUsersMu.Lock()
+			baasUsers[deviceID] = baasUser{User: userID, Password: pw}
+			saveBaasUsersLocked()
+			baasUsersMu.Unlock()
+			u := baasUserInfo(userID, deviceID, "", "", time.Now().Unix())
+			u["deviceAccounts"] = []map[string]any{{"id": deviceID, "password": pw}}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(u)
+			log.Printf("[baas-jwks]     registered user %s (device account %s)", userID, deviceID)
+			return
+		}
+
+		if r.Method == http.MethodPost && (r.URL.Path == "/1.0.0/login" || r.URL.Path == "/1.0.0/federation") {
+			body, _ := io.ReadAll(r.Body)
+			form, _ := url.ParseQuery(string(body))
+			log.Printf("[baas-jwks]     LOGIN %s id=%s appAuthNToken=%v naCountry=%s", r.URL.Path, form.Get("id"), form.Get("appAuthNToken") != "", form.Get("naCountry"))
+			deviceID := strings.ToLower(form.Get("id"))
+			baasUsersMu.Lock()
+			bu, known := baasUsers[deviceID]
+			baasUsersMu.Unlock()
+			if len(deviceID) != 16 || !known {
+				// Not registered here: real BaaS answers 401 invalid_grant, and the console registers again.
+				log.Printf("[baas-jwks]     login: device account %q unknown (add it to %s, or let the console register)", deviceID, baasUsersPath())
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(map[string]any{"errorCode": "invalid_grant", "type": "https://e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com/errors/invalid_grant", "title": "Invalid grant", "status": 401})
+				return
+			}
+			userID := bu.User
+			pid, name := nextendoAccountFor(userID)
+			now := time.Now().Unix()
+			const gameAud = "ed9e2f05d286f7b8" // the aud production puts in login tokens
+			idClaims := map[string]any{
+				"iss": issuer, "sub": userID, "aud": gameAud, "jku": issuer + "/1.0.0/certificates",
+				"typ": "id_token", "bs:did": deviceID, "iat": now, "exp": now + 10800, "jti": newJTI(),
+			}
+			if pid != 0 {
+				if nnex := signNex(pid, name); nnex != "" {
+					idClaims["nnex"] = nnex
+				}
+			}
+			accessClaims := map[string]any{
+				"iss": issuer, "sub": userID, "aud": gameAud, "jku": issuer + "/1.0.0/internal_certificates",
+				"typ": "token", "bs:did": deviceID, "bs:grt": 2, "iat": now, "exp": now + 10800, "jti": newJTI(),
+			}
+			if name == "" {
+				name = "Player"
+			}
+			user := baasUserInfo(userID, deviceID, bu.NA, name, now)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"expiresIn": 10800, "user": user,
+				"idToken": mintToken("id_token", idClaims), "accessToken": mintToken("token", accessClaims),
+				"tokenType": "Bearer", "summary": map[string]any{"nintendo": map[string]any{"hasMembership": true}},
+			})
+			log.Printf("[baas-jwks]     login ok: user %s -> Nextendo PID %d (%s)", userID, pid, name)
+			return
+		}
+
 		if isJWKS {
 			w.Header().Set("Content-Type", "application/json")
 			w.Write(jwksJSON)
@@ -209,7 +438,15 @@ func main() {
 			idToken := mintToken("id_token", idClaims)
 			accessToken := mintToken("access_token", accessClaims)
 			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store, no-cache")
+			// Real BaaS answers in camelCase (expiresIn, accessToken, tokenType). A console reads only
+			// those: with snake_case alone it reported 2124-3121 ("BaaS server returned invalid
+			// response but http status indicates success"). The snake_case copies stay for older clients.
 			_ = json.NewEncoder(w).Encode(map[string]any{
+				"expiresIn":    10800,
+				"accessToken":  accessToken,
+				"tokenType":    "Bearer",
+				"idToken":      idToken,
 				"access_token": accessToken,
 				"id_token":     idToken,
 				"token_type":   "Bearer",
