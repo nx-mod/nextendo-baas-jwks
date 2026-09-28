@@ -527,6 +527,21 @@ func main() {
 				return
 			}
 		}
+		// PUT /1.0.0/push_channels/<user>/<device account> {"service","deviceToken","deviceAttributes"}: the
+		// console registers its push channel after penne links, while linking an existing user (a 404 gave
+		// 2154-7062). Not captured from production; stored nowhere, echoed back as the resource.
+		if seg := strings.Split(strings.Trim(p, "/"), "/"); r.Method == http.MethodPut && len(seg) == 4 && seg[0] == "1.0.0" && seg[1] == "push_channels" {
+			var in map[string]any
+			json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in)
+			if in == nil {
+				in = map[string]any{}
+			}
+			now := time.Now().Unix()
+			in["userId"], in["deviceAccountId"], in["createdAt"], in["updatedAt"] = seg[2], seg[3], now, now
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(in)
+			return
+		}
 		// Thumbnails (cdn-image host): /1/<user> and /2/<user>, see completeUser.
 		if seg := strings.Split(strings.Trim(p, "/"), "/"); r.Method == http.MethodGet && len(seg) == 2 && (seg[0] == "1" || seg[0] == "2") && len(seg[1]) == 16 {
 			thumbnail(w, strings.ToLower(seg[1]))
