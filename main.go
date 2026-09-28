@@ -35,6 +35,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -110,13 +111,15 @@ type baasUser struct {
 	User     string `json:"user"`
 	NA       string `json:"na,omitempty"`
 	Password string `json:"password,omitempty"`
-	Country  string `json:"country,omitempty"` // naCountry from the console's last login
+	Country  string `json:"country,omitempty"`  // naCountry from the console's last login
+	LoggedIn bool   `json:"loggedIn,omitempty"` // has used /1.0.0/login: a federation from it is a link, else an import
 }
 
 // accountProfile is what a user reply needs from the Nextendo account (nextendo-account /internal/identity).
 type accountProfile struct {
 	FriendCode     string `json:"friendCode"`
 	Avatar         string `json:"avatar"` // base64 image, "" if none
+	Mii            string `json:"mii"`    // the console's Mii as synced to the account (production's extras.self.nxAccount)
 	ImageUpdatedAt int64  `json:"imageUpdatedAt"`
 }
 
@@ -161,12 +164,95 @@ func completeUser(u map[string]any, userID string, pid uint64, country string) {
 			"regenerableAt": created + 30*24*3600, "updatedAt": created}
 	}
 	uploaded := p.ImageUpdatedAt
+	if st, err := os.Stat(filepath.Join(imagesDir(), userID+".jpg")); err == nil { // uploaded by the console
+		uploaded = st.ModTime().Unix()
+	}
 	if uploaded == 0 {
 		uploaded = created
 	}
 	u["thumbnailUrl"] = cdnImage + "/1/" + userID
 	u["thumbnail2Url"] = cdnImage + "/2/" + userID
 	u["thumbnailUploadedAt"] = uploaded
+	if p.Mii != "" {
+		if extras, ok := u["extras"].(map[string]any); ok {
+			extras["self"] = map[string]any{"playLog": "", "nxAccount": p.Mii}
+		}
+	}
+	applyUserPatches(u, userID)
+}
+
+// What the console has PATCHed into a user (/nickname, /extras/self/nxAccount, /thumbnailUrl, ...), by user
+// id and JSON pointer. Every user reply carries it back: the console checks the PATCH reply against what it
+// sent (a reply without it gave 2124-3121 at the end of linking a Nintendo Account).
+var (
+	userPatchesMu sync.Mutex
+	userPatches   = map[string]map[string]any{}
+)
+
+func userPatchesPath() string {
+	return getenv("BAAS_USER_PATCHES_FILE", filepath.Join(filepath.Dir(baasUsersPath()), "baas_user_patches.json"))
+}
+
+func loadUserPatches() {
+	if b, err := os.ReadFile(userPatchesPath()); err == nil {
+		json.Unmarshal(b, &userPatches)
+	}
+}
+
+// patchUser records a PATCH body: a JSON patch ([{"op","path","value"}]) or a plain object of top-level fields.
+// Returns the paths set.
+func patchUser(userID string, body []byte) []string {
+	set := map[string]any{}
+	var ops []struct {
+		Op    string `json:"op"`
+		Path  string `json:"path"`
+		Value any    `json:"value"`
+	}
+	if json.Unmarshal(body, &ops) == nil {
+		for _, o := range ops {
+			if (o.Op == "replace" || o.Op == "add") && strings.HasPrefix(o.Path, "/") {
+				set[o.Path] = o.Value
+			}
+		}
+	} else {
+		var obj map[string]any
+		json.Unmarshal(body, &obj)
+		for k, v := range obj {
+			set["/"+k] = v
+		}
+	}
+	paths := make([]string, 0, len(set))
+	userPatchesMu.Lock()
+	if userPatches[userID] == nil {
+		userPatches[userID] = map[string]any{}
+	}
+	for p, v := range set {
+		userPatches[userID][p] = v
+		paths = append(paths, p)
+	}
+	b, _ := json.MarshalIndent(userPatches, "", "  ")
+	userPatchesMu.Unlock()
+	os.WriteFile(userPatchesPath(), b, 0o600)
+	sort.Strings(paths)
+	return paths
+}
+
+func applyUserPatches(u map[string]any, userID string) {
+	userPatchesMu.Lock()
+	defer userPatchesMu.Unlock()
+	for p, v := range userPatches[userID] {
+		keys := strings.Split(strings.TrimPrefix(p, "/"), "/")
+		m := u
+		for _, k := range keys[:len(keys)-1] {
+			next, ok := m[k].(map[string]any)
+			if !ok {
+				next = map[string]any{}
+				m[k] = next
+			}
+			m = next
+		}
+		m[keys[len(keys)-1]] = v
+	}
 }
 
 // thumbnail answers GET /1/<user> and /2/<user> (cdn-image host): the account's avatar as a JPEG, or a
@@ -302,6 +388,21 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 	}
 	now := time.Now().Unix()
 	switch {
+	case strings.Contains(host, "op2.nintendo.net") && r.Method == http.MethodGet && strings.HasPrefix(p, "/v1/users/"):
+		// NSO membership (capi.lp1.op2.nintendo.net, NintendoClients: NSO Membership Verification). Production
+		// Nextendo's reply: an active "default" membership, no expansion pack ("ex"). Unanswered, the console
+		// could not open or delete a user linked to a Nintendo Account.
+		seg := strings.Split(strings.Trim(p, "/"), "/")
+		if len(seg) != 4 {
+			return false
+		}
+		id, exp := seg[2], now+365*24*3600
+		def := map[string]any{"context": "default", "membership": map[string]any{"active": true, "expires_at": exp}, "user_id": id}
+		if seg[3] == "membership" {
+			return reply(http.StatusOK, def)
+		}
+		ex := map[string]any{"context": "ex", "membership": map[string]any{"active": false}, "user_id": id}
+		return reply(http.StatusOK, map[string]any{"count": 2, "items": []any{ex, def}, "total": 2})
 	case strings.Contains(host, "ctest"):
 		// The connection test: since 18.0.0 the console checks https://api.hac.lp1.ctest.srv.nintendo.net,
 		// and fails Test Connection without it (2160-8035; 2160-6000 on a plain-text reply). Production
@@ -408,6 +509,7 @@ func main() {
 	jwksPath := getenv("BAAS_JWKS_PATH", "/1.0.0/certificates")
 
 	loadBaasUsers()
+	loadUserPatches()
 	priv := loadPrivateKey(keyPath)
 	pub := &priv.PublicKey
 	eBytes := big.NewInt(int64(pub.E)).Bytes()
@@ -517,6 +619,10 @@ func main() {
 					}
 				}
 				baasUsersMu.Unlock()
+				if r.Method == http.MethodPatch {
+					body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
+					log.Printf("[baas-jwks]     user %s patched: %v", userID, patchUser(userID, body))
+				}
 				pid, name := nextendoAccountFor(userID)
 				u := baasUserInfo(userID, deviceID, naID, name, time.Now().Unix())
 				completeUser(u, userID, pid, country)
@@ -661,9 +767,14 @@ func main() {
 				return
 			}
 			userID := bu.User
-			if c := form.Get("naCountry"); c != "" && c != bu.Country {
+			if c := form.Get("naCountry"); (c != "" && c != bu.Country) || (r.URL.Path == "/1.0.0/login" && !bu.LoggedIn) {
 				baasUsersMu.Lock()
-				bu.Country = c
+				if c != "" {
+					bu.Country = c
+				}
+				if r.URL.Path == "/1.0.0/login" {
+					bu.LoggedIn = true
+				}
 				baasUsers[deviceID] = bu
 				saveBaasUsersLocked()
 				baasUsersMu.Unlock()
@@ -682,6 +793,29 @@ func main() {
 					}
 					json.Unmarshal(claims["nintendo"], &nin)
 					ai = strings.ToLower(nin.AI)
+				}
+				// Import (Add User -> sign in with a Nintendo Account): the console registers a temporary user
+				// and federates at once, without logging in first. Production's reply (captured 2026-09-28) is
+				// the Nintendo Account's own user, with the temporary device account moved onto it (no new
+				// password) and the link; the console then logs in with that device account. For an account
+				// with no user yet, its user is the Nextendo account's BaaS user (nintendo.ai).
+				if !bu.LoggedIn && naID != "" {
+					target := ""
+					baasUsersMu.Lock()
+					for d, u := range baasUsers {
+						if d != deviceID && u.NA == naID && u.User != userID {
+							target = u.User
+							break
+						}
+					}
+					baasUsersMu.Unlock()
+					if target == "" && len(ai) == 16 {
+						target = ai
+					}
+					if target != "" && target != userID {
+						log.Printf("[baas-jwks]     federation (import): Nintendo Account %s -> its user %s; device account %s moved from the temporary user %s", naID, target, deviceID, userID)
+						bu.User, userID = target, target
+					}
 				}
 				if naID != "" {
 					baasUsersMu.Lock()
