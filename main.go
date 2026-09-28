@@ -176,6 +176,21 @@ func nextendoAccountFor(userID string) (uint64, string) {
 	return out.PID, out.Name
 }
 
+// bindBaasUser asks nextendo-account (local open mode) to make userID the NSA id of the account with this PID.
+func bindBaasUser(pid uint64, userID string) {
+	body, _ := json.Marshal(map[string]any{"pid": pid, "baas": userID})
+	req, _ := http.NewRequest("POST", getenv("BAAS_ACCOUNT_URL", "http://127.0.0.1:8080")+"/internal/baas-link", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Internal-Key", os.Getenv("NEXTENDO_INTERNAL_KEY"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		log.Printf("[baas-jwks] /internal/baas-link: %v", err)
+		return
+	}
+	resp.Body.Close()
+	log.Printf("[baas-jwks]     PID %d now owns BaaS user %s (status %d)", pid, userID, resp.StatusCode)
+}
+
 func main() {
 	cert := getenv("CERT_FILE", "/certs/cert.pem")
 	key := getenv("KEY_FILE", "/certs/key.pem")
@@ -381,10 +396,11 @@ func main() {
 				return
 			}
 			userID := bu.User
-			// Federation (link or import a Nintendo Account): the user is the one that Nintendo Account belongs
-			// to. nnaccount's id_token names it (sub = Nintendo Account id, nintendo.ai = the Nextendo account's
-			// BaaS user id, which /api/nsa resolves to that account); otherwise a user already linked to it; else
-			// this device's user, now linked. The device account is moved onto that user.
+			// Federation (link or import a Nintendo Account): the console keeps the user it registered (it
+			// refuses a reply naming another user: 2124-0292), now linked to the Nintendo Account. nnaccount's
+			// id_token names the Nextendo account (sub = Nintendo Account id, nintendo.ai = that account's
+			// current BaaS user id), and nextendo-account (local open mode) makes this user its NSA id, so
+			// /api/nsa, the game servers and nnex all resolve it to the account that signed in.
 			if r.URL.Path == "/1.0.0/federation" {
 				naID, ai := "", ""
 				if claims, ok := decodeAssertion(form.Get("idToken")); ok {
@@ -395,27 +411,19 @@ func main() {
 					json.Unmarshal(claims["nintendo"], &nin)
 					ai = strings.ToLower(nin.AI)
 				}
-				baasUsersMu.Lock()
-				target := userID
-				if len(ai) == 16 {
-					target = ai
-				} else if naID != "" {
-					for _, u := range baasUsers {
-						if u.NA == naID {
-							target = u.User
-							break
-						}
+				if naID != "" {
+					baasUsersMu.Lock()
+					bu.NA = naID
+					baasUsers[deviceID] = bu
+					saveBaasUsersLocked()
+					baasUsersMu.Unlock()
+				}
+				if len(ai) == 16 && ai != userID {
+					if pid, _ := nextendoAccountFor(ai); pid != 0 {
+						bindBaasUser(pid, userID)
 					}
 				}
-				if naID != "" {
-					bu.NA = naID
-				}
-				bu.User = target
-				baasUsers[deviceID] = bu
-				saveBaasUsersLocked()
-				baasUsersMu.Unlock()
-				log.Printf("[baas-jwks]     federation: Nintendo Account %s -> user %s (device account %s, was user %s)", naID, target, deviceID, userID)
-				userID = target
+				log.Printf("[baas-jwks]     federation: Nintendo Account %s linked to user %s (Nextendo account of BaaS user %s)", naID, userID, ai)
 			}
 			pid, name := nextendoAccountFor(userID)
 			now := time.Now().Unix()
