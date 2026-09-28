@@ -30,6 +30,7 @@ import (
 	"io"
 	"log"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -301,6 +302,25 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 	}
 	now := time.Now().Unix()
 	switch {
+	case strings.Contains(host, "ctest"):
+		// The connection test (NintendoClients wiki, Connection-Test): since 18.0.0 the console checks
+		// https://api.hac.lp1.ctest.srv.nintendo.net, and fails Test Connection (2160-8035) without it.
+		// /v1/time: the time in milliseconds and the client's address, as text and as X-NINTENDO-* headers.
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		ms := strconv.FormatInt(time.Now().UnixMilli(), 10)
+		w.Header().Set("X-NINTENDO-UNIXTIME", ms)
+		w.Header().Set("X-NINTENDO-GLOBAL-IP", ip)
+		w.Header().Set("X-Organization", "Nintendo")
+		w.Header().Set("Content-Type", "text/plain")
+		switch p {
+		case "/v1/time":
+			io.WriteString(w, ms+"\n"+ip)
+		case "/v1/ip":
+			io.WriteString(w, ip)
+		default:
+			io.WriteString(w, "ok")
+		}
+		return true
 	case strings.Contains(host, "penne") && r.Method == http.MethodPost && p == "/v1/login_tickets" && penneFrontlineOn:
 		return reply(http.StatusOK, map[string]any{"expires_at": now + 4*24*3600, "frontline_fqdn": penneFrontline,
 			"issued_at": now, "persistent_connection_params_simple": penneConnParams, "ticket": randHex(32)})
