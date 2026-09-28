@@ -300,12 +300,30 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 		return reply(http.StatusOK, map[string]any{"current_time": now, "frontline_fqdn": penneFrontline,
 			"persistent_connection_params_simple": penneConnParams})
 	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/links"):
-		// Linking an existing user registers its account with penne right after notification_tokens; a
-		// 404 here also ends in 2154-5404. Not captured from production: answered like vermillion's
-		// devices/initialize, and the body is logged.
-		body, _ := io.ReadAll(r.Body)
-		log.Printf("[baas-jwks]     penne links body=%s", body)
-		return reply(http.StatusNoContent, nil)
+		// Linking an existing user registers its NSA with penne right after notification_tokens, sending
+		// {"penne_id","password","nsa_id_token"}. A 404 ends in 2154-5404 and an empty 204 in 2154-7023, so
+		// it wants a JSON body; production's is not captured, so this echoes the link. Only the field names
+		// are logged: the body carries the console's penne password.
+		var in map[string]any
+		json.NewDecoder(r.Body).Decode(&in)
+		keys := make([]string, 0, len(in))
+		for k := range in {
+			keys = append(keys, k)
+		}
+		log.Printf("[baas-jwks]     penne links fields=%v", keys)
+		nsaID := ""
+		if tok, _ := in["nsa_id_token"].(string); tok != "" {
+			if parts := strings.Split(tok, "."); len(parts) == 3 {
+				if raw, err := base64.RawURLEncoding.DecodeString(parts[1]); err == nil {
+					var c struct {
+						Sub string `json:"sub"`
+					}
+					json.Unmarshal(raw, &c)
+					nsaID = c.Sub
+				}
+			}
+		}
+		return reply(http.StatusOK, map[string]any{"nsa_id": nsaID, "penne_id": in["penne_id"], "created_at": now})
 	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/notification_tokens"):
 		return reply(http.StatusOK, map[string]any{"notification_token": "00" + hex.EncodeToString(stable("npt", p, 17))})
 	case strings.Contains(host, "vermillion") && r.Method == http.MethodPost && p == "/v1/devices/initialize":
@@ -704,9 +722,15 @@ func main() {
 			log.Printf("[baas-jwks]     DEBUG access_token=%s", accessToken)
 			return
 		}
-		// Unknown endpoint: 404, with the body logged so the next missing call shows what it sends.
-		body, _ := io.ReadAll(io.LimitReader(r.Body, 2048))
-		log.Printf("[baas-jwks]     NOT HANDLED -> 404, body=%q", body)
+		// Unknown endpoint: 404, logging the field names of a JSON body (not the values: they can be
+		// passwords or tokens) so the next missing call shows its shape.
+		var in map[string]any
+		json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&in)
+		keys := make([]string, 0, len(in))
+		for k := range in {
+			keys = append(keys, k)
+		}
+		log.Printf("[baas-jwks]     NOT HANDLED -> 404, body fields=%v", keys)
 		w.WriteHeader(http.StatusNotFound)
 	})
 
