@@ -10,13 +10,13 @@
 package main
 
 import (
+	"bytes"
 	"crypto"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
-	"bytes"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -300,6 +300,41 @@ func main() {
 				_ = json.NewEncoder(w).Encode(baasUserInfo(userID, deviceID, naID, name, time.Now().Unix()))
 				return
 			}
+			// DELETE /1.0.0/users/<user>/device_accounts/<id>: the console drops a device account, e.g. the one of
+			// the temporary user it registered before importing a Nintendo Account. Only removed while it still
+			// belongs to that user (federation may have moved it to the imported one).
+			if len(seg) == 5 && seg[3] == "device_accounts" && r.Method == http.MethodDelete {
+				dev := strings.ToLower(seg[4])
+				baasUsersMu.Lock()
+				if u, ok := baasUsers[dev]; ok && u.User == userID {
+					delete(baasUsers, dev)
+					saveBaasUsersLocked()
+				}
+				baasUsersMu.Unlock()
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			// POST /1.0.0/users/<user>/device_accounts: a new device account for an existing user (this console
+			// joining a user imported from a Nintendo Account); the password is shown once, as at registration.
+			if len(seg) == 4 && seg[3] == "device_accounts" && r.Method == http.MethodPost {
+				dev, pw := randHex(8), randHex(20)
+				naID := ""
+				baasUsersMu.Lock()
+				for _, u := range baasUsers {
+					if u.User == userID && u.NA != "" {
+						naID = u.NA
+					}
+				}
+				baasUsers[dev] = baasUser{User: userID, Password: pw, NA: naID}
+				saveBaasUsersLocked()
+				baasUsersMu.Unlock()
+				now := time.Now().Unix()
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(map[string]any{"id": dev, "password": pw, "createdAt": now, "updatedAt": now})
+				log.Printf("[baas-jwks]     device account %s added to user %s", dev, userID)
+				return
+			}
 			if r.Method == http.MethodGet { // blocks, friends, friend_requests/inbox, ...: nothing yet
 				w.Header().Set("Content-Type", "application/json")
 				_ = json.NewEncoder(w).Encode(emptyList)
@@ -346,6 +381,42 @@ func main() {
 				return
 			}
 			userID := bu.User
+			// Federation (link or import a Nintendo Account): the user is the one that Nintendo Account belongs
+			// to. nnaccount's id_token names it (sub = Nintendo Account id, nintendo.ai = the Nextendo account's
+			// BaaS user id, which /api/nsa resolves to that account); otherwise a user already linked to it; else
+			// this device's user, now linked. The device account is moved onto that user.
+			if r.URL.Path == "/1.0.0/federation" {
+				naID, ai := "", ""
+				if claims, ok := decodeAssertion(form.Get("idToken")); ok {
+					json.Unmarshal(claims["sub"], &naID)
+					var nin struct {
+						AI string `json:"ai"`
+					}
+					json.Unmarshal(claims["nintendo"], &nin)
+					ai = strings.ToLower(nin.AI)
+				}
+				baasUsersMu.Lock()
+				target := userID
+				if len(ai) == 16 {
+					target = ai
+				} else if naID != "" {
+					for _, u := range baasUsers {
+						if u.NA == naID {
+							target = u.User
+							break
+						}
+					}
+				}
+				if naID != "" {
+					bu.NA = naID
+				}
+				bu.User = target
+				baasUsers[deviceID] = bu
+				saveBaasUsersLocked()
+				baasUsersMu.Unlock()
+				log.Printf("[baas-jwks]     federation: Nintendo Account %s -> user %s (device account %s, was user %s)", naID, target, deviceID, userID)
+				userID = target
+			}
 			pid, name := nextendoAccountFor(userID)
 			now := time.Now().Unix()
 			const gameAud = "ed9e2f05d286f7b8" // the aud production puts in login tokens
