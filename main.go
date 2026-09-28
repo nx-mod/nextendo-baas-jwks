@@ -257,7 +257,10 @@ func nextendoAccountFor(userID string) (uint64, string) {
 
 // penne (push notifications) and vermillion (device) calls the account sysmodule makes around a login, in
 // production's shapes (baas-proxy log). A 404 on notification_tokens stops linking an existing user with
-// 2124-5404. The frontline stream (fro-*.penne, POST /) is held open with nothing to push.
+// 2124-5404. Login tickets and frontlines stay unanswered (404) unless BAAS_PENNE_FRONTLINE=1: with a
+// ticket the console opens the frontline push stream (fro-*.penne, POST /), which is not served; answered
+// at once it reconnects every two seconds, and held open it hung System Settings.
+var penneFrontlineOn = os.Getenv("BAAS_PENNE_FRONTLINE") == "1"
 var penneConnParams = map[string]any{
 	"awake":      map[string]any{"count": 2, "disable": false, "idle": 60, "interval": 10},
 	"ignore_rst": true, "retry_count": 2, "rtt_max": 1000,
@@ -290,23 +293,14 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 	}
 	now := time.Now().Unix()
 	switch {
-	case strings.Contains(host, "penne") && r.Method == http.MethodPost && p == "/v1/login_tickets":
+	case strings.Contains(host, "penne") && r.Method == http.MethodPost && p == "/v1/login_tickets" && penneFrontlineOn:
 		return reply(http.StatusOK, map[string]any{"expires_at": now + 4*24*3600, "frontline_fqdn": penneFrontline,
 			"issued_at": now, "persistent_connection_params_simple": penneConnParams, "ticket": randHex(32)})
-	case strings.Contains(host, "penne") && r.Method == http.MethodGet && p == "/v1/frontlines":
+	case strings.Contains(host, "penne") && r.Method == http.MethodGet && p == "/v1/frontlines" && penneFrontlineOn:
 		return reply(http.StatusOK, map[string]any{"current_time": now, "frontline_fqdn": penneFrontline,
 			"persistent_connection_params_simple": penneConnParams})
 	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/notification_tokens"):
 		return reply(http.StatusOK, map[string]any{"notification_token": "00" + hex.EncodeToString(stable("npt", p, 17))})
-	case strings.HasPrefix(host, "fro-") && r.Method == http.MethodPost && p == "/":
-		// The frontline is a long-lived push connection (production's never answers within the capture).
-		// Answering at once made the console reconnect every two seconds; it is held open instead, with
-		// nothing to push, until the console drops it (at most an hour, its wait_sec).
-		select {
-		case <-r.Context().Done():
-		case <-time.After(time.Hour):
-		}
-		return true
 	case strings.Contains(host, "vermillion") && r.Method == http.MethodPost && p == "/v1/devices/initialize":
 		return reply(http.StatusNoContent, nil)
 	case strings.Contains(host, "vermillion") && r.Method == http.MethodGet && p == "/v1/devices/vermillion-device-id":
