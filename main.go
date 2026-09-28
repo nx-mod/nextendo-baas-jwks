@@ -306,7 +306,12 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 		// The connection test (NintendoClients wiki, Connection-Test): since 18.0.0 the console checks
 		// https://api.hac.lp1.ctest.srv.nintendo.net, and fails Test Connection (2160-8035) without it.
 		// /v1/time: the time in milliseconds and the client's address, as text and as X-NINTENDO-* headers.
+		// Behind sni-router the peer is 127.0.0.1, which the console rejected as its global address
+		// (2160-6000): BAAS_GLOBAL_IP (the stack's LAN address) is reported instead.
 		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+		if g := os.Getenv("BAAS_GLOBAL_IP"); g != "" && (ip == "" || net.ParseIP(ip).IsLoopback()) {
+			ip = g
+		}
 		ms := strconv.FormatInt(time.Now().UnixMilli(), 10)
 		w.Header().Set("X-NINTENDO-UNIXTIME", ms)
 		w.Header().Set("X-NINTENDO-GLOBAL-IP", ip)
