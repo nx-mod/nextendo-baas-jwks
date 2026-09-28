@@ -369,6 +369,68 @@ const penneFrontline = "fro-1.hac.lp1.penne.srv.nintendo.net"
 // {"version":{"major":1,"minor":1,"micro":0},"online_license":{"is_available":true},"activity":{...},...}.
 const vermillionConfig = "eyJ2ZXJzaW9uIjp7Im1ham9yIjoxLCJtaW5vciI6MSwibWljcm8iOjB9LCJvbmxpbmVfbGljZW5zZSI6eyJpc19hdmFpbGFibGUiOnRydWV9LCJhY3Rpdml0eSI6eyJoYXNfcmVjZWl2ZWRfZ3VpZGFuY2UiOnRydWUsImhhc19pbnNlcnRlZCI6dHJ1ZSwiaGFzX3RyYW5zZmVycmVkX3RvX3ZwaHltIjp0cnVlfSwiZGlzYWJsZWRfY29udGVudCI6eyJjb250ZW50X21ldGFfaWRzIjpbXX0sImhpZGRlbl9rZXkiOnsiYXBwbGljYXRpb25faWRzIjpbXX19"
 
+// captureFrontline records the penne frontline push stream (fro-*.penne, a long-lived HTTP/2 POST /) to learn
+// its protocol: the request headers (secret-looking values masked) and up to 15 s of what the console sends,
+// in BAAS_FRONTLINE_DIR/<time>.txt/.bin. Response headers go out at once; the stream then ends cleanly
+// (held open indefinitely, it hung System Settings).
+func captureFrontline(w http.ResponseWriter, r *http.Request) {
+	dir := getenv("BAAS_FRONTLINE_DIR", "frontline")
+	os.MkdirAll(dir, 0o755)
+	name := filepath.Join(dir, time.Now().Format("20060102-150405.000"))
+	var hdr strings.Builder
+	fmt.Fprintf(&hdr, "%s %s %s%s\n", r.Proto, r.Method, r.Host, r.URL.RequestURI())
+	keys := make([]string, 0, len(r.Header))
+	for k := range r.Header {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := strings.Join(r.Header[k], ", ")
+		lk := strings.ToLower(k)
+		if strings.Contains(lk, "auth") || strings.Contains(lk, "ticket") || strings.Contains(lk, "token") || len(v) > 64 {
+			v = fmt.Sprintf("<%d bytes>", len(v))
+		}
+		fmt.Fprintf(&hdr, "%s: %s\n", k, v)
+	}
+	os.WriteFile(name+".txt", []byte(hdr.String()), 0o600)
+	log.Printf("[baas-jwks]     frontline %s %s, headers %v -> %s.*", r.Proto, r.Method, keys, name)
+
+	w.Header().Set("Content-Type", r.Header.Get("Content-Type"))
+	w.WriteHeader(http.StatusOK)
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	var (
+		mu   sync.Mutex
+		body bytes.Buffer
+	)
+	done := make(chan struct{})
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, err := r.Body.Read(buf)
+			mu.Lock()
+			body.Write(buf[:n])
+			full := body.Len() > 1<<20
+			mu.Unlock()
+			if err != nil || full {
+				break
+			}
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(15 * time.Second):
+	case <-r.Context().Done():
+	}
+	mu.Lock()
+	got := append([]byte(nil), body.Bytes()...)
+	mu.Unlock()
+	os.WriteFile(name+".bin", got, 0o600)
+	log.Printf("[baas-jwks]     frontline stream: %d bytes from the console in its first 15 s", len(got))
+}
+
 func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 	host, p := strings.ToLower(r.Host), r.URL.Path
 	if i := strings.IndexByte(host, ':'); i >= 0 {
@@ -592,6 +654,10 @@ func main() {
 		w.Header().Set("Cache-Control", "no-store, no-cache")
 		emptyList := map[string]any{"count": 0, "etag": "", "items": []any{}, "itemsPerPage": 0}
 		p := r.URL.Path
+		if strings.HasPrefix(r.Host, "fro-") && strings.Contains(r.Host, "penne") {
+			captureFrontline(w, r)
+			return
+		}
 		if pennePresence(w, r) {
 			return
 		}
