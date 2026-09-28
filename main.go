@@ -299,6 +299,13 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 	case strings.Contains(host, "penne") && r.Method == http.MethodGet && p == "/v1/frontlines" && penneFrontlineOn:
 		return reply(http.StatusOK, map[string]any{"current_time": now, "frontline_fqdn": penneFrontline,
 			"persistent_connection_params_simple": penneConnParams})
+	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/links"):
+		// Linking an existing user registers its account with penne right after notification_tokens; a
+		// 404 here also ends in 2154-5404. Not captured from production: answered like vermillion's
+		// devices/initialize, and the body is logged.
+		body, _ := io.ReadAll(r.Body)
+		log.Printf("[baas-jwks]     penne links body=%s", body)
+		return reply(http.StatusNoContent, nil)
 	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/notification_tokens"):
 		return reply(http.StatusOK, map[string]any{"notification_token": "00" + hex.EncodeToString(stable("npt", p, 17))})
 	case strings.Contains(host, "vermillion") && r.Method == http.MethodPost && p == "/v1/devices/initialize":
@@ -697,7 +704,9 @@ func main() {
 			log.Printf("[baas-jwks]     DEBUG access_token=%s", accessToken)
 			return
 		}
-		// Unknown BAAS endpoint — log it so we discover what else S2 needs, return empty 404.
+		// Unknown endpoint: 404, with the body logged so the next missing call shows what it sends.
+		body, _ := io.ReadAll(io.LimitReader(r.Body, 2048))
+		log.Printf("[baas-jwks]     NOT HANDLED -> 404, body=%q", body)
 		w.WriteHeader(http.StatusNotFound)
 	})
 
