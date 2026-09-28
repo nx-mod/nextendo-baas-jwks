@@ -12,6 +12,7 @@
 - **Push reconnect loop / Settings hang**: penne login tickets off unless `BAAS_PENNE_FRONTLINE=1`.
 - **User PATCH ignored**: `/nickname`, `/extras/self/nxAccount`, `/thumbnailUrl`... are kept
   (`baas_user_patches.json`) and in every user reply; `thumbnailUploadedAt` follows the uploaded image.
+- **Device tokens in the log**: `/token` requests are logged by field name only.
 - **Unknown requests**: logged with their body's field names (never values).
 
 ## Credits

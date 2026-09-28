@@ -938,7 +938,14 @@ func main() {
 		}
 		if isToken {
 			body, _ := io.ReadAll(r.Body)
-			log.Printf("[baas-jwks]     TOKEN body=%q", string(body))
+			if vals, err := url.ParseQuery(string(body)); err == nil { // field names only: the assertion is a device token
+				names := make([]string, 0, len(vals))
+				for k := range vals {
+					names = append(names, k)
+				}
+				sort.Strings(names)
+				log.Printf("[baas-jwks]     TOKEN fields=%v", names)
+			}
 			r.Body = io.NopCloser(bytes.NewReader(body))
 			r.ParseForm()
 			assertion := r.FormValue("assertion")
