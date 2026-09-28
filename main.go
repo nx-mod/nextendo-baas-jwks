@@ -569,22 +569,21 @@ func main() {
 			os.MkdirAll(imagesDir(), 0o755)
 			os.WriteFile(filepath.Join(imagesDir(), owner+".jpg"), raw, 0o644)
 			log.Printf("[baas-jwks]     profile image for user %s (%d bytes)", owner, len(raw))
-			// The reply is the updated user, as BaaS answers other user changes: {ownerId, thumbnail URLs}
-			// alone gave 2124-3121 ("invalid response but http status indicates success").
-			deviceID, naID, country := "", "", ""
-			baasUsersMu.Lock()
-			for d, u := range baasUsers {
-				if u.User == owner {
-					deviceID, naID, country = d, u.NA, u.Country
-				}
+			// The reply is the stored image, in the shape NintendoClients' wiki documents (BAAS Server,
+			// POST /1.0.0/image_upload); a user object or bare thumbnail URLs gave 2124-3121. The console
+			// then sets the user's thumbnailUrl to content.url.
+			width, height := 256, 256
+			if cfg, _, err := image.DecodeConfig(bytes.NewReader(raw)); err == nil {
+				width, height = cfg.Width, cfg.Height
 			}
-			baasUsersMu.Unlock()
-			pid, name := nextendoAccountFor(owner)
-			u := baasUserInfo(owner, deviceID, naID, name, time.Now().Unix())
-			completeUser(u, owner, pid, country)
-			u["thumbnailUploadedAt"] = time.Now().Unix()
+			imgID, now := randHex(16), time.Now().Unix()
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(u)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"id": imgID, "ownerId": owner, "owner": map[string]any{"id": owner}, "state": "STORED",
+				"content": map[string]any{"id": imgID, "width": width, "height": height, "format": "jpg",
+					"url": cdnImage + "/1/" + owner, "urlExpiresAt": 2147483647},
+				"createdAt": now, "updatedAt": now,
+			})
 			return
 		}
 		// Thumbnails (cdn-image host): /1/<user> and /2/<user>, see completeUser.
