@@ -303,26 +303,25 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 	now := time.Now().Unix()
 	switch {
 	case strings.Contains(host, "ctest"):
-		// The connection test (NintendoClients wiki, Connection-Test): since 18.0.0 the console checks
-		// https://api.hac.lp1.ctest.srv.nintendo.net, and fails Test Connection (2160-8035) without it.
-		// /v1/time: the time in milliseconds and the client's address, as text and as X-NINTENDO-* headers.
-		// Behind sni-router the peer is 127.0.0.1, which the console rejected as its global address
-		// (2160-6000): BAAS_GLOBAL_IP (the stack's LAN address) is reported instead.
+		// The connection test: since 18.0.0 the console checks https://api.hac.lp1.ctest.srv.nintendo.net,
+		// and fails Test Connection without it (2160-8035; 2160-6000 on a plain-text reply). Production
+		// Nextendo's replies (captured 2026-09-28): /v1/ip {"ip":"<addr>"}, /v1/time {"unixtime":"<ms>"}.
+		// Behind sni-router the peer is 127.0.0.1: BAAS_GLOBAL_IP (the stack's LAN address) is reported.
 		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
 		if g := os.Getenv("BAAS_GLOBAL_IP"); g != "" && (ip == "" || net.ParseIP(ip).IsLoopback()) {
 			ip = g
 		}
-		ms := strconv.FormatInt(time.Now().UnixMilli(), 10)
-		w.Header().Set("X-NINTENDO-UNIXTIME", ms)
-		w.Header().Set("X-NINTENDO-GLOBAL-IP", ip)
-		w.Header().Set("X-Organization", "Nintendo")
-		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Pragma", "no-cache")
 		switch p {
-		case "/v1/time":
-			io.WriteString(w, ms+"\n"+ip)
 		case "/v1/ip":
-			io.WriteString(w, ip)
+			w.Header().Set("Content-Type", "application/json; charset=UTF-8")
+			_ = json.NewEncoder(w).Encode(map[string]string{"ip": ip})
+		case "/v1/time":
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]string{"unixtime": strconv.FormatInt(time.Now().UnixMilli(), 10)})
 		default:
+			w.Header().Set("Content-Type", "text/plain")
+			w.Header().Set("X-Organization", "Nintendo")
 			io.WriteString(w, "ok")
 		}
 		return true
