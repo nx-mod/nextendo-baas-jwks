@@ -311,14 +311,20 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 		if g := os.Getenv("BAAS_GLOBAL_IP"); g != "" && (ip == "" || net.ParseIP(ip).IsLoopback()) {
 			ip = g
 		}
+		// Byte for byte as production: no trailing newline, its cache headers.
 		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Vary", "Accept-Encoding,Origin")
+		exact := func(ct string, v any) {
+			b, _ := json.Marshal(v)
+			w.Header().Set("Content-Type", ct)
+			w.Header().Set("Content-Length", strconv.Itoa(len(b)))
+			w.Write(b)
+		}
 		switch p {
 		case "/v1/ip":
-			w.Header().Set("Content-Type", "application/json; charset=UTF-8")
-			_ = json.NewEncoder(w).Encode(map[string]string{"ip": ip})
+			exact("application/json; charset=UTF-8", map[string]string{"ip": ip})
 		case "/v1/time":
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]string{"unixtime": strconv.FormatInt(time.Now().UnixMilli(), 10)})
+			exact("application/json", map[string]string{"unixtime": strconv.FormatInt(time.Now().UnixMilli(), 10)})
 		default:
 			w.Header().Set("Content-Type", "text/plain")
 			w.Header().Set("X-Organization", "Nintendo")
