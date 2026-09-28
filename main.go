@@ -22,6 +22,11 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
+	_ "image/png"
 	"io"
 	"log"
 	"math/big"
@@ -103,6 +108,80 @@ type baasUser struct {
 	User     string `json:"user"`
 	NA       string `json:"na,omitempty"`
 	Password string `json:"password,omitempty"`
+	Country  string `json:"country,omitempty"` // naCountry from the console's last login
+}
+
+// accountProfile is what a user reply needs from the Nextendo account (nextendo-account /internal/identity).
+type accountProfile struct {
+	FriendCode     string `json:"friendCode"`
+	Avatar         string `json:"avatar"` // base64 image, "" if none
+	ImageUpdatedAt int64  `json:"imageUpdatedAt"`
+}
+
+func profileFor(pid uint64) accountProfile {
+	var p accountProfile
+	if pid == 0 {
+		return p
+	}
+	req, _ := http.NewRequest("GET", getenv("BAAS_ACCOUNT_URL", "http://127.0.0.1:8080")+"/internal/identity?pid="+strconv.FormatUint(pid, 10), nil)
+	req.Header.Set("X-Internal-Key", os.Getenv("NEXTENDO_INTERNAL_KEY"))
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return p
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		json.NewDecoder(resp.Body).Decode(&p)
+	}
+	return p
+}
+
+// The host production serves user thumbnails from (thumbnailUrl / thumbnail2Url); DNS-redirected here.
+const cdnImage = "https://cdn-image-e0d67c509fb203858ebcb2fe3f88c2aa.baas.nintendo.com"
+
+// completeUser fills what production always sends for a user and a console checks once a Nintendo Account is
+// linked: the country, a real friend code, and thumbnails (served by this server, from the account's avatar).
+func completeUser(u map[string]any, userID string, pid uint64, country string) {
+	if country == "" {
+		country = "US"
+	}
+	u["country"] = country
+	p := profileFor(pid)
+	const created = int64(1550779720)
+	fc := strings.TrimPrefix(p.FriendCode, "SW-")
+	if fc == "" {
+		n, _ := strconv.ParseUint(userID, 16, 64)
+		d := fmt.Sprintf("%012d", n%1_000_000_000_000)
+		fc = d[0:4] + "-" + d[4:8] + "-" + d[8:12]
+	}
+	if links, ok := u["links"].(map[string]any); ok {
+		links["friendCode"] = map[string]any{"createdAt": created, "id": fc, "regenerable": true,
+			"regenerableAt": created + 30*24*3600, "updatedAt": created}
+	}
+	uploaded := p.ImageUpdatedAt
+	if uploaded == 0 {
+		uploaded = created
+	}
+	u["thumbnailUrl"] = cdnImage + "/1/" + userID
+	u["thumbnail2Url"] = cdnImage + "/2/" + userID
+	u["thumbnailUploadedAt"] = uploaded
+}
+
+// thumbnail answers GET /1/<user> and /2/<user> (cdn-image host): the account's avatar as a JPEG, or a
+// plain Nextendo-red square when it has none.
+func thumbnail(w http.ResponseWriter, userID string) {
+	pid, _ := nextendoAccountFor(userID)
+	var img image.Image
+	if raw, err := base64.StdEncoding.DecodeString(profileFor(pid).Avatar); err == nil && len(raw) > 0 {
+		img, _, _ = image.Decode(bytes.NewReader(raw))
+	}
+	if img == nil {
+		m := image.NewRGBA(image.Rect(0, 0, 256, 256))
+		draw.Draw(m, m.Bounds(), &image.Uniform{color.RGBA{230, 0, 18, 255}}, image.Point{}, draw.Src)
+		img = m
+	}
+	w.Header().Set("Content-Type", "image/jpeg")
+	jpeg.Encode(w, img, &jpeg.Options{Quality: 90})
 }
 
 var (
@@ -302,17 +381,19 @@ func main() {
 		if seg := strings.Split(strings.Trim(p, "/"), "/"); len(seg) >= 3 && seg[1] == "users" && len(seg[2]) == 16 {
 			userID := strings.ToLower(seg[2])
 			if len(seg) == 3 && seg[0] == "1.0.0" && (r.Method == http.MethodGet || r.Method == http.MethodPatch) {
-				deviceID, naID := "", ""
+				deviceID, naID, country := "", "", ""
 				baasUsersMu.Lock()
 				for d, u := range baasUsers {
 					if u.User == userID {
-						deviceID, naID = d, u.NA
+						deviceID, naID, country = d, u.NA, u.Country
 					}
 				}
 				baasUsersMu.Unlock()
-				_, name := nextendoAccountFor(userID)
+				pid, name := nextendoAccountFor(userID)
+				u := baasUserInfo(userID, deviceID, naID, name, time.Now().Unix())
+				completeUser(u, userID, pid, country)
 				w.Header().Set("Content-Type", "application/json")
-				_ = json.NewEncoder(w).Encode(baasUserInfo(userID, deviceID, naID, name, time.Now().Unix()))
+				_ = json.NewEncoder(w).Encode(u)
 				return
 			}
 			// DELETE /1.0.0/users/<user>/device_accounts/<id>: the console drops a device account, e.g. the one of
@@ -356,6 +437,11 @@ func main() {
 				return
 			}
 		}
+		// Thumbnails (cdn-image host): /1/<user> and /2/<user>, see completeUser.
+		if seg := strings.Split(strings.Trim(p, "/"), "/"); r.Method == http.MethodGet && len(seg) == 2 && (seg[0] == "1" || seg[0] == "2") && len(seg[1]) == 16 {
+			thumbnail(w, strings.ToLower(seg[1]))
+			return
+		}
 		if r.Method == http.MethodGet && p == "/1.0.0/users" {
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(emptyList)
@@ -396,6 +482,13 @@ func main() {
 				return
 			}
 			userID := bu.User
+			if c := form.Get("naCountry"); c != "" && c != bu.Country {
+				baasUsersMu.Lock()
+				bu.Country = c
+				baasUsers[deviceID] = bu
+				saveBaasUsersLocked()
+				baasUsersMu.Unlock()
+			}
 			// Federation (link or import a Nintendo Account): the console keeps the user it registered (it
 			// refuses a reply naming another user: 2124-0292), now linked to the Nintendo Account. nnaccount's
 			// id_token names the Nextendo account (sub = Nintendo Account id, nintendo.ai = that account's
@@ -445,12 +538,14 @@ func main() {
 				name = "Player"
 			}
 			user := baasUserInfo(userID, deviceID, bu.NA, name, now)
+			completeUser(user, userID, pid, bu.Country)
 			w.Header().Set("Content-Type", "application/json")
 			w.Header().Set("Cache-Control", "no-store, no-cache")
+			// Production's shape: exactly these five keys.
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"expiresIn": 10800, "user": user,
 				"idToken": mintToken("id_token", idClaims), "accessToken": mintToken("token", accessClaims),
-				"tokenType": "Bearer", "summary": map[string]any{"nintendo": map[string]any{"hasMembership": true}},
+				"tokenType": "Bearer",
 			})
 			log.Printf("[baas-jwks]     login ok: user %s -> Nextendo PID %d (%s)", userID, pid, name)
 			return
