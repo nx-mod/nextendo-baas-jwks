@@ -257,7 +257,7 @@ func nextendoAccountFor(userID string) (uint64, string) {
 
 // penne (push notifications) and vermillion (device) calls the account sysmodule makes around a login, in
 // production's shapes (baas-proxy log). A 404 on notification_tokens stops linking an existing user with
-// 2124-5404. The frontline stream (fro-*.penne, POST /) is not served.
+// 2124-5404. The frontline stream (fro-*.penne, POST /) is held open with nothing to push.
 var penneConnParams = map[string]any{
 	"awake":      map[string]any{"count": 2, "disable": false, "idle": 60, "interval": 10},
 	"ignore_rst": true, "retry_count": 2, "rtt_max": 1000,
@@ -298,6 +298,15 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 			"persistent_connection_params_simple": penneConnParams})
 	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/notification_tokens"):
 		return reply(http.StatusOK, map[string]any{"notification_token": "00" + hex.EncodeToString(stable("npt", p, 17))})
+	case strings.HasPrefix(host, "fro-") && r.Method == http.MethodPost && p == "/":
+		// The frontline is a long-lived push connection (production's never answers within the capture).
+		// Answering at once made the console reconnect every two seconds; it is held open instead, with
+		// nothing to push, until the console drops it (at most an hour, its wait_sec).
+		select {
+		case <-r.Context().Done():
+		case <-time.After(time.Hour):
+		}
+		return true
 	case strings.Contains(host, "vermillion") && r.Method == http.MethodPost && p == "/v1/devices/initialize":
 		return reply(http.StatusNoContent, nil)
 	case strings.Contains(host, "vermillion") && r.Method == http.MethodGet && p == "/v1/devices/vermillion-device-id":
@@ -358,7 +367,13 @@ func main() {
 	// provided claims map is serialized as the payload; iss/jku must be derived from the
 	// baas host the console actually contacted so the jku it fetches lands back on this server.
 	mintToken := func(typ string, claims map[string]any) string {
-		header := b64urlJSON(map[string]any{"alg": "RS256", "kid": kid, "typ": typ})
+		// Production's header: typ is always "JWT", and id and access tokens name different keys (both are
+		// in the JWKS). The token kind is the "typ" claim.
+		k := kidBaasID
+		if typ == "token" || typ == "access_token" {
+			k = kidBaasAccess
+		}
+		header := b64urlJSON(map[string]any{"alg": "RS256", "jku": claims["jku"], "kid": k, "typ": "JWT"})
 		payload := b64urlJSON(claims)
 		sum := sha256.Sum256([]byte(header + "." + payload))
 		sig, err := rsa.SignPKCS1v15(rand.Reader, priv, crypto.SHA256, sum[:])
