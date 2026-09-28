@@ -255,6 +255,59 @@ func nextendoAccountFor(userID string) (uint64, string) {
 	return out.PID, out.Name
 }
 
+// penne (push notifications) and vermillion (device) calls the account sysmodule makes around a login, in
+// production's shapes (baas-proxy log). A 404 on notification_tokens stops linking an existing user with
+// 2124-5404. The frontline stream (fro-*.penne, POST /) is not served.
+var penneConnParams = map[string]any{
+	"awake":      map[string]any{"count": 2, "disable": false, "idle": 60, "interval": 10},
+	"ignore_rst": true, "retry_count": 2, "rtt_max": 1000,
+	"sleep":    map[string]any{"count": 1440, "disable": true, "idle": 60, "interval": 10},
+	"wait_sec": 3600, "wowl_timeout": 200,
+}
+
+const penneFrontline = "fro-1.hac.lp1.penne.srv.nintendo.net"
+
+// accounts/config as production sends it: base64 of
+// {"version":{"major":1,"minor":1,"micro":0},"online_license":{"is_available":true},"activity":{...},...}.
+const vermillionConfig = "eyJ2ZXJzaW9uIjp7Im1ham9yIjoxLCJtaW5vciI6MSwibWljcm8iOjB9LCJvbmxpbmVfbGljZW5zZSI6eyJpc19hdmFpbGFibGUiOnRydWV9LCJhY3Rpdml0eSI6eyJoYXNfcmVjZWl2ZWRfZ3VpZGFuY2UiOnRydWUsImhhc19pbnNlcnRlZCI6dHJ1ZSwiaGFzX3RyYW5zZmVycmVkX3RvX3ZwaHltIjp0cnVlfSwiZGlzYWJsZWRfY29udGVudCI6eyJjb250ZW50X21ldGFfaWRzIjpbXX0sImhpZGRlbl9rZXkiOnsiYXBwbGljYXRpb25faWRzIjpbXX19"
+
+func pennePresence(w http.ResponseWriter, r *http.Request) bool {
+	host, p := strings.ToLower(r.Host), r.URL.Path
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	reply := func(code int, v any) bool {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(code)
+		if v != nil {
+			_ = json.NewEncoder(w).Encode(v)
+		}
+		return true
+	}
+	stable := func(kind, id string, n int) []byte { // the same value every time for the same id
+		sum := sha256.Sum256([]byte(kind + ":" + id))
+		return sum[:n]
+	}
+	now := time.Now().Unix()
+	switch {
+	case strings.Contains(host, "penne") && r.Method == http.MethodPost && p == "/v1/login_tickets":
+		return reply(http.StatusOK, map[string]any{"expires_at": now + 4*24*3600, "frontline_fqdn": penneFrontline,
+			"issued_at": now, "persistent_connection_params_simple": penneConnParams, "ticket": randHex(32)})
+	case strings.Contains(host, "penne") && r.Method == http.MethodGet && p == "/v1/frontlines":
+		return reply(http.StatusOK, map[string]any{"current_time": now, "frontline_fqdn": penneFrontline,
+			"persistent_connection_params_simple": penneConnParams})
+	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/notification_tokens"):
+		return reply(http.StatusOK, map[string]any{"notification_token": "00" + hex.EncodeToString(stable("npt", p, 17))})
+	case strings.Contains(host, "vermillion") && r.Method == http.MethodPost && p == "/v1/devices/initialize":
+		return reply(http.StatusNoContent, nil)
+	case strings.Contains(host, "vermillion") && r.Method == http.MethodGet && p == "/v1/devices/vermillion-device-id":
+		return reply(http.StatusOK, map[string]any{"vermillionDeviceId": base64.StdEncoding.EncodeToString(stable("vdid", r.Header.Get("Authorization"), 16))})
+	case strings.Contains(host, "vermillion") && r.Method == http.MethodGet && p == "/v1/accounts/config":
+		return reply(http.StatusOK, map[string]any{"payload": vermillionConfig})
+	}
+	return false
+}
+
 // bindBaasUser asks nextendo-account (local open mode) to make userID the NSA id of the account with this PID.
 func bindBaasUser(pid uint64, userID string) {
 	body, _ := json.Marshal(map[string]any{"pid": pid, "baas": userID})
@@ -365,6 +418,9 @@ func main() {
 		w.Header().Set("Cache-Control", "no-store, no-cache")
 		emptyList := map[string]any{"count": 0, "etag": "", "items": []any{}, "itemsPerPage": 0}
 		p := r.URL.Path
+		if pennePresence(w, r) {
+			return
+		}
 		if r.Method == http.MethodPost && p == "/1.0.0/devices/snapshot" {
 			var in struct {
 				UserIDs []string `json:"userIds"`
