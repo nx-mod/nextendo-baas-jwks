@@ -33,6 +33,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -169,7 +170,14 @@ func completeUser(u map[string]any, userID string, pid uint64, country string) {
 
 // thumbnail answers GET /1/<user> and /2/<user> (cdn-image host): the account's avatar as a JPEG, or a
 // plain Nextendo-red square when it has none.
+func imagesDir() string { return getenv("BAAS_IMAGES_DIR", "images") }
+
 func thumbnail(w http.ResponseWriter, userID string) {
+	if b, err := os.ReadFile(filepath.Join(imagesDir(), userID+".jpg")); err == nil { // uploaded by the console
+		w.Header().Set("Content-Type", "image/jpeg")
+		w.Write(b)
+		return
+	}
 	pid, _ := nextendoAccountFor(userID)
 	var img image.Image
 	if raw, err := base64.StdEncoding.DecodeString(profileFor(pid).Avatar); err == nil && len(raw) > 0 {
@@ -540,6 +548,31 @@ func main() {
 			in["userId"], in["deviceAccountId"], in["createdAt"], in["updatedAt"] = seg[2], seg[3], now, now
 			w.Header().Set("Content-Type", "application/json")
 			_ = json.NewEncoder(w).Encode(in)
+			return
+		}
+		// POST /1.0.0/image_upload {"rawContent": base64 JPEG, "ownerId": user, "allowTransform"}: the console
+		// uploads the user's profile picture; a 404 ends linking a Nintendo Account in 2124-7962. Kept in
+		// BAAS_IMAGES_DIR as <user>.jpg and served as the user's thumbnails. Production's reply is not
+		// captured: the thumbnails' URLs.
+		if r.Method == http.MethodPost && p == "/1.0.0/image_upload" {
+			var in struct {
+				RawContent string `json:"rawContent"`
+				OwnerID    string `json:"ownerId"`
+			}
+			json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(&in)
+			owner := strings.ToLower(in.OwnerID)
+			raw, err := base64.StdEncoding.DecodeString(in.RawContent)
+			if len(owner) != 16 || err != nil || len(raw) == 0 {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			os.MkdirAll(imagesDir(), 0o755)
+			os.WriteFile(filepath.Join(imagesDir(), owner+".jpg"), raw, 0o644)
+			log.Printf("[baas-jwks]     profile image for user %s (%d bytes)", owner, len(raw))
+			now := time.Now().Unix()
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{"ownerId": owner, "thumbnailUrl": cdnImage + "/1/" + owner,
+				"thumbnail2Url": cdnImage + "/2/" + owner, "thumbnailUploadedAt": now})
 			return
 		}
 		// Thumbnails (cdn-image host): /1/<user> and /2/<user>, see completeUser.
