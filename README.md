@@ -1,24 +1,13 @@
-<h1 align="center">baas-jwks</h1>
+# nextendo-baas-jwks (nx-mod testing)
 
-<p align="center"><b>Serves the JWK Set that lets a client verify a BAAS <code>id_token</code> signature.</b></p>
+nx-mod's `testing` fork of [baas-jwks](https://github.com/NextendoNetwork/baas-jwks): Serves the JWK Set for BAAS id_token verification. Part of the Nextendo Network stack.
+Part of [nextendo-testing](https://github.com/nx-mod/nextendo-testing): the whole Nextendo Network, run on a LAN. Upstream's README is kept as [README.upstream.md](README.upstream.md).
 
-<p align="center">
-  <img src="https://img.shields.io/badge/license-PolyForm%20Shield%201.0.0-orange" alt="License">
-  <img src="https://img.shields.io/badge/go-1.21%2B-00ADD8" alt="Go">
-</p>
+## nx-mod changes
 
----
+- Signs with an RSA key from disk and publishes its JWK.
+- **BaaS for a real console:** camelCase token replies (without them the console shows 2124-3121), `/1.0.0/users` registration, device-account `/1.0.0/login` and `/federation` mapped to the console's user (`BAAS_USERS_FILE`), `users/<id>`, `devices/snapshot`, empty friends/blocks lists; the login idToken carries the signed Nextendo identity (`nnex`) the game servers check.
 
-Part of the [Nextendo Network](https://nextendo.network) stack. Some titles locally verify the
-account (BAAS) `id_token` before allowing online entry: they fetch the JSON Web Key Set from the
-token's `jku` URL and check the RS256 signature against the matching public key.
+## Credits
 
-**baas-jwks** answers that fetch. It publishes the **public** JWK derived from the RSA key the client
-signs its `id_token` with (the `kid` matches the token header). It ships **no private key**: the
-signing key is supplied to the signer separately, at runtime. Every other path is logged and 404'd.
-
-Configuration is through environment variables; no secrets or infrastructure addresses are baked in.
-
-## License
-
-Released under the **[PolyForm Shield License 1.0.0](LICENSE.md)**, source-available.
+baas-jwks is the work of the **Nextendo Network team** — https://nextendo.network. nx-mod only adds the changes above, for LAN testing. Nextendo is awesome.
