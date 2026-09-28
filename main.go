@@ -569,10 +569,22 @@ func main() {
 			os.MkdirAll(imagesDir(), 0o755)
 			os.WriteFile(filepath.Join(imagesDir(), owner+".jpg"), raw, 0o644)
 			log.Printf("[baas-jwks]     profile image for user %s (%d bytes)", owner, len(raw))
-			now := time.Now().Unix()
+			// The reply is the updated user, as BaaS answers other user changes: {ownerId, thumbnail URLs}
+			// alone gave 2124-3121 ("invalid response but http status indicates success").
+			deviceID, naID, country := "", "", ""
+			baasUsersMu.Lock()
+			for d, u := range baasUsers {
+				if u.User == owner {
+					deviceID, naID, country = d, u.NA, u.Country
+				}
+			}
+			baasUsersMu.Unlock()
+			pid, name := nextendoAccountFor(owner)
+			u := baasUserInfo(owner, deviceID, naID, name, time.Now().Unix())
+			completeUser(u, owner, pid, country)
+			u["thumbnailUploadedAt"] = time.Now().Unix()
 			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(map[string]any{"ownerId": owner, "thumbnailUrl": cdnImage + "/1/" + owner,
-				"thumbnail2Url": cdnImage + "/2/" + owner, "thumbnailUploadedAt": now})
+			_ = json.NewEncoder(w).Encode(u)
 			return
 		}
 		// Thumbnails (cdn-image host): /1/<user> and /2/<user>, see completeUser.
