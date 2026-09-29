@@ -8,7 +8,22 @@
 
 ## Penne (push, firmware 18+; replaces NPNS)
 
-1. **Frontline protocol**: read it from the capture; if needed, reverse the npns sysmodule (as bcat was).
+1. **Frontline protocol**: being reversed from the npns sysmodule (22.5.0). Known so far:
+   - Request (captured): HTTP/2 `POST /`, `Content-Type: application/x-www-form-urlencoded`, `X-Protocol-Version: 4`,
+     `X-Hug: true`, `X-Network-Type`, `X-Power-State`, `X-System-Version`, `Authorization` (the login ticket);
+     empty body: the console only listens.
+   - Response headers it reads: `X-Fro-Result`, `X-NPC`, `X-Tolerant`, `X-Execution`, `X-LoginTicket-TTL`.
+   - Commands it expects down the stream, in order: `HandoverResult`, then `LeafHash`/`RootHash` (a record-set
+     sync), then steady state `PutRecord`/`DeleteRecord` (records such as `topic.subscription`). Errors:
+     `ProtocolVersionError`, `TwinRecordParseError`.
+   - Wire encoding: FlatBuffers, one table per message with a union `command`. Union types (22.5.0):
+     1 MessageRequest, 2 PublishRequest, 3 KickRequest, 4 PutRecord, 5 DeleteRecord, 6 RootHash, 7 LeafHash,
+     8 SyncComplete, 9 Ack, 10 HandoverRequest, 11 HandoverResponse, 12 HandoverResult, 13 Reset, 14 PowerState,
+     15 DebugDisconnect, 16 Ping, 17 Pong, 18 DebugUpdateRecord, 19 DebugDeleteRecord, 20 Idle, 21 PutRequest,
+     22 DeleteRequest, 23 SubscribeTopic, 24 Nack, 25 SubscriptionList, 26 ResendRequest, 27 DAPresence,
+     28 SubscriptionListRequest, 29 MyAccountMessageRequest, 30 ReloadLink, 31 SubscriptionUpdated, 32 Hi,
+     33 Onset, 34 PresenceNotifyRequest, 35 DenySubscribe, 36 TopicRead, 37 CrewNotifyRequest.
+   - Steady state accepts 4, 5, 9, 13, 16, 17, 20, 24, 25, 31, 32. Next: each table's fields and the framing.
 2. **Push**: the message that makes a console fetch now; bcat-nx sends it when a news file changes.
 3. **penne-nx**: move penne out of baas-jwks into its own server and repo (`nextendo-penne-nx`).
 - Known and answered: `notification_tokens`, `links`, `push_channels` (BaaS), `login_tickets`, `frontlines`.
