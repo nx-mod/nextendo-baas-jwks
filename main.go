@@ -18,6 +18,7 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -370,9 +371,9 @@ const penneFrontline = "fro-1.hac.lp1.penne.srv.nintendo.net"
 const vermillionConfig = "eyJ2ZXJzaW9uIjp7Im1ham9yIjoxLCJtaW5vciI6MSwibWljcm8iOjB9LCJvbmxpbmVfbGljZW5zZSI6eyJpc19hdmFpbGFibGUiOnRydWV9LCJhY3Rpdml0eSI6eyJoYXNfcmVjZWl2ZWRfZ3VpZGFuY2UiOnRydWUsImhhc19pbnNlcnRlZCI6dHJ1ZSwiaGFzX3RyYW5zZmVycmVkX3RvX3ZwaHltIjp0cnVlfSwiZGlzYWJsZWRfY29udGVudCI6eyJjb250ZW50X21ldGFfaWRzIjpbXX0sImhpZGRlbl9rZXkiOnsiYXBwbGljYXRpb25faWRzIjpbXX19"
 
 // captureFrontline records the penne frontline push stream (fro-*.penne, a long-lived HTTP/2 POST /) to learn
-// its protocol: the request headers (secret-looking values masked) and up to 15 s of what the console sends,
-// in BAAS_FRONTLINE_DIR/<time>.txt/.bin. Response headers go out at once; the stream then ends cleanly
-// (held open indefinitely, it hung System Settings).
+// its protocol: the request headers (secret-looking values masked) and what the console sends within
+// penneCaptureWindow, in BAAS_FRONTLINE_DIR/<time>.txt/.bin. It answers the first step (HandoverResult); the
+// stream then ends cleanly (held open with nothing sent, it hung System Settings).
 func captureFrontline(w http.ResponseWriter, r *http.Request) {
 	dir := getenv("BAAS_FRONTLINE_DIR", "frontline")
 	os.MkdirAll(dir, 0o755)
@@ -400,35 +401,227 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+	// The console waits 70 s for a HandoverResult (success) as the first message: send it, then record what
+	// it does next.
+	w.Write(penneMessage(penneHandoverResult))
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
+	// Read the console's messages (4-byte length + FlatBuffer). Its first is RootHash: the SHA-1 of each of
+	// its record sets (c-appearance, c-friends, c-settings, c-storage). Answer with the same hashes ("the
+	// server holds the same records") and SyncComplete, then log what follows.
 	var (
-		mu   sync.Mutex
-		body bytes.Buffer
+		mu     sync.Mutex
+		body   bytes.Buffer
+		frames int
 	)
 	done := make(chan struct{})
 	go func() {
-		buf := make([]byte, 4096)
+		defer close(done)
+		var hdr [4]byte
 		for {
-			n, err := r.Body.Read(buf)
+			if _, err := io.ReadFull(r.Body, hdr[:]); err != nil {
+				return
+			}
+			n := binary.LittleEndian.Uint32(hdr[:])
+			if n == 0 || n > 1<<20 {
+				return
+			}
+			msg := make([]byte, n)
+			if _, err := io.ReadFull(r.Body, msg); err != nil {
+				return
+			}
+			kind := penneKind(msg)
 			mu.Lock()
-			body.Write(buf[:n])
-			full := body.Len() > 1<<20
+			body.Write(hdr[:])
+			body.Write(msg)
+			frames++
+			first := frames == 1
 			mu.Unlock()
-			if err != nil || full {
-				break
+			log.Printf("[baas-jwks]     frontline <- message %d: type %d, %d bytes", frames, kind, n)
+			if kind == penneReset {
+				log.Printf("[baas-jwks]     frontline <- Reset: %s", penneResetText(msg))
+			}
+			// The console's RootHash lists its record sets' hashes. A server RootHash names the sets to compare
+			// leaf by leaf (echoing all four made it send LeafHash and wait for PutRecord/DeleteRecord; a
+			// SyncComplete there got a Reset). Experiment: an empty RootHash = nothing to compare. At most
+			// once per penneTryEvery, so a rejected reply cannot become a reconnect loop.
+			if first && kind == penneRootHash && penneMayTry() {
+				w.Write(penneRootHashEmpty)
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+				log.Printf("[baas-jwks]     frontline -> RootHash with no sets")
+			}
+			// SubscribeTopic {1: flag, 2: list, 3: topic}: the console keeps the topic as its pending key and
+			// waits 10 s for an Ack carrying it (npns asserts on an Ack whose string differs, or with nothing
+			// pending: only ever answer a request just read, with its own key).
+			if kind == penneSubscribeTopic {
+				if topic := penneCommandString(msg, 3); topic != "" {
+					w.Write(penneAckMessage(topic))
+					if f, ok := w.(http.Flusher); ok {
+						f.Flush()
+					}
+					log.Printf("[baas-jwks]     frontline <- SubscribeTopic %s -> Ack", topic)
+				}
 			}
 		}
-		close(done)
 	}()
 	select {
 	case <-done:
-	case <-time.After(15 * time.Second):
+	case <-time.After(penneCaptureWindow):
 	case <-r.Context().Done():
 	}
 	mu.Lock()
 	got := append([]byte(nil), body.Bytes()...)
+	n := frames
 	mu.Unlock()
 	os.WriteFile(name+".bin", got, 0o600)
-	log.Printf("[baas-jwks]     frontline stream: %d bytes from the console in its first 15 s", len(got))
+	log.Printf("[baas-jwks]     frontline stream: %d message(s), %d bytes from the console in %s", n, len(got), penneCaptureWindow)
+}
+
+// Penne frontline messages (npns 22.5.0): a 4-byte little-endian length, then a FlatBuffer whose root table is
+// {0: command type (ubyte), 1: command (union table), 2: string, 3: u64, 4: u64}.
+const (
+	penneRootHash       = 6  // {0: [{0: record set name, 1: its 20-byte SHA-1}]}
+	penneSyncComplete   = 8  // {}
+	penneHandoverResult = 12 // {0: byte}: 0 or absent = the handover succeeded
+	penneCaptureWindow  = 120 * time.Second
+)
+
+const (
+	penneAck            = 9  // {0: the key of the request it answers}
+	penneReset          = 13 // {0: u16, 1: u16, 2: text}: the console gives up, and says why
+	penneSubscribeTopic = 23 // {1: flag, 2: list, 3: topic}; its key is the topic
+	penneTryEvery       = 20 * time.Second
+)
+
+// penneCommandString is string field n of a message's command table, "" if absent or malformed.
+func penneCommandString(b []byte, n int) (s string) {
+	defer func() {
+		if recover() != nil {
+			s = ""
+		}
+	}()
+	u32 := func(p int) int { return int(binary.LittleEndian.Uint32(b[p:])) }
+	u16 := func(p int) int { return int(binary.LittleEndian.Uint16(b[p:])) }
+	root := u32(0)
+	vt := root - int(int32(u32(root)))
+	cmd := root + u16(vt+6)
+	cmd += u32(cmd)
+	cvt := cmd - int(int32(u32(cmd)))
+	if u16(cvt) < 4+2*(n+1) || u16(cvt+4+2*n) == 0 {
+		return ""
+	}
+	p := cmd + u16(cvt+4+2*n)
+	p += u32(p)
+	return string(b[p+4 : p+4+u32(p)])
+}
+
+// penneAckMessage is a framed Ack for the request whose key is key.
+func penneAckMessage(key string) []byte {
+	str := append([]byte(key), 0)
+	for len(str)%4 != 0 {
+		str = append(str, 0)
+	}
+	b := []byte{
+		0, 0, 0, 0, // frame length, set below
+		12, 0, 0, 0, // root table at 12
+		8, 0, 12, 0, 8, 0, 4, 0, // root vtable: field 0 at +8, field 1 at +4
+		8, 0, 0, 0, // root table
+		16, 0, 0, 0, // field 1: the command table, 16 bytes on (at 32)
+		penneAck, 0, 0, 0, // field 0: the command type
+		6, 0, 8, 0, 4, 0, 0, 0, // command vtable: size 6, table 8 bytes, field 0 at +4 (then padding)
+		8, 0, 0, 0, // command table
+		4, 0, 0, 0, // field 0: the string, 4 bytes on
+		0, 0, 0, 0, // string length, set below
+	}
+	binary.LittleEndian.PutUint32(b[44:], uint32(len(key)))
+	b = append(b, str...)
+	binary.LittleEndian.PutUint32(b, uint32(len(b)-4))
+	return b
+}
+
+var (
+	penneTryMu   sync.Mutex
+	penneLastTry time.Time
+)
+
+// penneMayTry is true at most once per penneTryEvery.
+func penneMayTry() bool {
+	penneTryMu.Lock()
+	defer penneTryMu.Unlock()
+	if time.Since(penneLastTry) < penneTryEvery {
+		return false
+	}
+	penneLastTry = time.Now()
+	return true
+}
+
+// penneRootHashEmpty is a framed RootHash whose list of record sets is empty.
+var penneRootHashEmpty = []byte{
+	44, 0, 0, 0, // frame: 44 bytes follow
+	12, 0, 0, 0, // root table at 12
+	8, 0, 12, 0, 8, 0, 4, 0, // root vtable: field 0 at +8, field 1 at +4
+	8, 0, 0, 0, // root table
+	16, 0, 0, 0, // field 1: the command table, 16 bytes on (at 32)
+	penneRootHash, 0, 0, 0, // field 0: the command type
+	6, 0, 8, 0, 4, 0, 0, 0, // command vtable: size 6, table 8 bytes, field 0 at +4 (then padding)
+	8, 0, 0, 0, // command table: its vtable is 8 bytes back
+	4, 0, 0, 0, // field 0: the vector, 4 bytes on
+	0, 0, 0, 0, // vector: no entries
+}
+
+// penneResetText is the reason in a Reset message (command field 2), "" if it has none.
+func penneResetText(b []byte) string {
+	defer func() { recover() }()
+	u32 := func(p int) int { return int(binary.LittleEndian.Uint32(b[p:])) }
+	u16 := func(p int) int { return int(binary.LittleEndian.Uint16(b[p:])) }
+	root := u32(0)
+	vt := root - int(int32(u32(root)))
+	cmd := root + u16(vt+6)
+	cmd += u32(cmd)
+	cvt := cmd - int(int32(u32(cmd)))
+	if u16(cvt) < 10 || u16(cvt+8) == 0 {
+		return fmt.Sprintf("(codes %d/%d)", u16(cmd+u16(cvt+4)), u16(cmd+u16(cvt+6)))
+	}
+	s := cmd + u16(cvt+8)
+	s += u32(s)
+	return fmt.Sprintf("%s (codes %d/%d)", b[s+4:s+4+u32(s)], u16(cmd+u16(cvt+4)), u16(cmd+u16(cvt+6)))
+}
+
+// penneKind is a message's command type (root field 0), 0 if it has none.
+func penneKind(b []byte) byte {
+	if len(b) < 8 {
+		return 0
+	}
+	root := int(binary.LittleEndian.Uint32(b))
+	if root+4 > len(b) {
+		return 0
+	}
+	vt := root - int(int32(binary.LittleEndian.Uint32(b[root:])))
+	if vt < 0 || vt+6 > len(b) || binary.LittleEndian.Uint16(b[vt:]) < 6 {
+		return 0
+	}
+	off := int(binary.LittleEndian.Uint16(b[vt+4:]))
+	if off == 0 || root+off >= len(b) {
+		return 0
+	}
+	return b[root+off]
+}
+
+// penneMessage is a framed message of the given type with an empty command table (every field at its default).
+func penneMessage(kind byte) []byte {
+	return []byte{
+		32, 0, 0, 0, // frame: 32 bytes follow
+		12, 0, 0, 0, // root table at 12
+		8, 0, 12, 0, 8, 0, 4, 0, // root vtable: size 8, table 12 bytes, field 0 at +8, field 1 at +4
+		8, 0, 0, 0, // root table: its vtable is 8 bytes back
+		12, 0, 0, 0, // field 1: the command table, 12 bytes on (at 28)
+		kind, 0, 0, 0, // field 0: the command type, and padding
+		4, 0, 4, 0, // command vtable: size 4, table 4 bytes, no fields
+		4, 0, 0, 0, // command table: its vtable is 4 bytes back
+	}
 }
 
 func pennePresence(w http.ResponseWriter, r *http.Request) bool {

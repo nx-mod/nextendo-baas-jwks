@@ -3,8 +3,9 @@
 ## In progress
 
 - **Linking an offline user, 2124-3121 after `PATCH users/<id>`**: PATCHes are now kept and echoed; retest.
-- **penne frontline capture**: login tickets and frontlines are on (`BAAS_PENNE_FRONTLINE=1`); the frontline stream
-  (`fro-*.penne`, HTTP/2 `POST /`) is recorded to `BAAS_FRONTLINE_DIR` (headers + 15 s of body), then closed.
+- **penne frontline: OFF** (`BAAS_PENNE_FRONTLINE=0`). A live session got through the handshake, then our `Ack` to
+  `SubscribeTopic` **crashed npns** on the console (2162-0002, title 010000000000002F). Do not turn it on again
+  until the crash report (sd:/atmosphere/crash_reports/*_010000000000002f.log) shows which assert fired.
 
 ## Penne (push, firmware 18+; replaces NPNS)
 
@@ -41,8 +42,20 @@
         (0x4f754da010). Anything else: "HandoverResult expected".
      3. Record sync (0x4f754da2f0, states 7/8): `RootHash` (6) / `LeafHash` (7) with 20-byte hashes (SHA-1
         size), `Reset` accepted; then `PutRecord`/`DeleteRecord` (0x4f754dbf20), `SyncComplete`, steady state (8).
-   - Next: RootHash/LeafHash/PutRecord layouts and how the console's own hash is built, then a server that sends
-     HandoverResult + a matching sync and holds the stream with Ping/Pong.
+   - Live exchange with a console (2026-09-30), server replies in brackets:
+     [HandoverResult] -> console `RootHash`: envelope string "NX", two timestamps (now, now + 1 h), and four
+     record sets with a SHA-1 each: `c-appearance`, `c-friends`, `c-settings`, `c-storage`.
+     [RootHash with an EMPTY list] -> console `SyncComplete`, then `SubscribeTopic` {1: flag = 1, 2: empty list,
+     3: topic} (seen: `nx_data_010064800f66a000`, `nx_notice`): accepted, no Reset. This is the working path.
+     [RootHash echoing the four sets] -> console `LeafHash` {0: "c-appearance", 1: no leaves}, then it expects
+     PutRecord/DeleteRecord; a SyncComplete there -> `Reset` {0: 401, 1: 1, 2: "PutRecord/DeleteRecord expected,
+     but "SyncComplete"(8) received."} and an immediate reconnect loop (rate-limit any experiment).
+     [Ack {0: topic}] after SubscribeTopic -> **npns aborted** (crash above). The console waits 10 s for the
+     answer (0x4f754dd590: pending key at +0x9370 = the topic, kind at +0x93a0, flag +0x9368); the Ack handler
+     (0x4f754deab0) asserts on state, the pending flag and the key, then acts by kind. Which check failed is
+     unknown: read the crash report's PC before trying any reply again.
+   - A Reset from the console carries the reason as text: the best debugging aid in this protocol.
+   - Next: the crash report; then the right answer to SubscribeTopic; then Ping/Pong to hold the stream.
 2. **Push**: the message that makes a console fetch now; bcat-nx sends it when a news file changes.
 3. **penne-nx**: move penne out of baas-jwks into its own server and repo (`nextendo-penne-nx`).
 - Known and answered: `notification_tokens`, `links`, `push_channels` (BaaS), `login_tickets`, `frontlines`.
