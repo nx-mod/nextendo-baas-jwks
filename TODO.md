@@ -32,7 +32,17 @@
    - A news push carries JSON bcat reads: `type`, `topic_id`, `wait_range`, `ha_wait_range_min/max`, `news_id`,
      `notification_type`, `url`, `one2one`.
    - Upstream (splatoon-3 `gateway.go`) only holds the stream open and sends nothing: no protocol to reuse.
-   - Next: the remaining tables, then the opening sequence (who speaks first, handover, hash sync).
+   - Opening sequence (npns 22.5.0, session state at +8):
+     1. Connect (0x4f754d9250, state 14 -> 7): `POST https://<frontline_fqdn>/`, `Authorization: Bearer <ticket>`,
+        `X-Power-State` awake|sleep, `X-Hug` true|false, `X-Protocol-Version: 4`, `X-System-Version`,
+        `X-Network-Type`. `X-Hug: true` = this connection is a handover (what our capture showed).
+     2. First message (0x4f754d9730, state 7): within 70 s the server must send `HandoverResult` (12) or
+        `Reset` (13). HandoverResult field 0 (byte): 0 or absent = success; non-zero = failed handover
+        (0x4f754da010). Anything else: "HandoverResult expected".
+     3. Record sync (0x4f754da2f0, states 7/8): `RootHash` (6) / `LeafHash` (7) with 20-byte hashes (SHA-1
+        size), `Reset` accepted; then `PutRecord`/`DeleteRecord` (0x4f754dbf20), `SyncComplete`, steady state (8).
+   - Next: RootHash/LeafHash/PutRecord layouts and how the console's own hash is built, then a server that sends
+     HandoverResult + a matching sync and holds the stream with Ping/Pong.
 2. **Push**: the message that makes a console fetch now; bcat-nx sends it when a news file changes.
 3. **penne-nx**: move penne out of baas-jwks into its own server and repo (`nextendo-penne-nx`).
 - Known and answered: `notification_tokens`, `links`, `push_channels` (BaaS), `login_tickets`, `frontlines`.
