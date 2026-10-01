@@ -6,3 +6,5 @@
 *.pem
 *.key
 *.pfx
+
+penne_push.bin

@@ -473,6 +473,8 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 				mu.Lock()
 				synced = true
 				mu.Unlock()
+				penneRegisterStream(send) // the console is ready for a push; /internal/penne-push can send one
+				defer penneUnregisterStream()
 			case pennePong:
 				mu.Lock()
 				pinged = false
@@ -919,6 +921,10 @@ func main() {
 		w.Header().Set("Cache-Control", "no-store, no-cache")
 		emptyList := map[string]any{"count": 0, "etag": "", "items": []any{}, "itemsPerPage": 0}
 		p := r.URL.Path
+		if r.URL.Path == "/internal/penne-push" {
+			handlePennePush(w, r)
+			return
+		}
 		if strings.HasPrefix(r.Host, "fro-") && strings.Contains(r.Host, "penne") {
 			captureFrontline(w, r)
 			return
