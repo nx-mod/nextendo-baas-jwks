@@ -54,8 +54,13 @@
      answer (0x4f754dd590: pending key at +0x9370 = the topic, kind at +0x93a0, flag +0x9368); the Ack handler
      (0x4f754deab0) asserts on state, the pending flag and the key, then acts by kind. Which check failed is
      unknown: read the crash report's PC before trying any reply again.
+   - Crash report read (PC in the Ack handler, 0x4f754debc8): the failed check is the key comparison. Pending
+     keys by request kind (the senders at 0x4f754dd590..0x4f754de5b0): kinds 0 and 1 = the record's own name,
+     kind 2 = the literal `topic.subscription`, kinds 3-7 = a 16-hex-digit id (kind 6: two, `a/b`), kind 10 =
+     another stored string. **Not confirmed:** which kind sends message type 23 (SubscribeTopic); kind 2 is the
+     likely one. No reply is sent until that is confirmed; an Ack with a wrong key always aborts npns.
    - A Reset from the console carries the reason as text: the best debugging aid in this protocol.
-   - Next: the crash report; then the right answer to SubscribeTopic; then Ping/Pong to hold the stream.
+   - Next: confirm the request kind behind SubscribeTopic (then its Ack key), then Ping/Pong to hold the stream.
 2. **Push**: the message that makes a console fetch now; bcat-nx sends it when a news file changes.
 3. **penne-nx**: move penne out of baas-jwks into its own server and repo (`nextendo-penne-nx`).
 - Known and answered: `notification_tokens`, `links`, `push_channels` (BaaS), `login_tickets`, `frontlines`.
