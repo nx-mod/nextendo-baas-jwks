@@ -12,7 +12,8 @@
    - Request (captured): HTTP/2 `POST /`, `Content-Type: application/x-www-form-urlencoded`, `X-Protocol-Version: 4`,
      `X-Hug: true`, `X-Network-Type`, `X-Power-State`, `X-System-Version`, `Authorization` (the login ticket);
      empty body: the console only listens.
-   - Response headers it reads: `X-Fro-Result`, `X-NPC`, `X-Tolerant`, `X-Execution`, `X-LoginTicket-TTL`.
+   - `GET /v1/frontlines` carries the last attempt's outcome as request headers (`X-NPC`, `X-Login-Try`,
+     `X-Fro-Result`, `X-Tolerant`); its reply's `current_time` must be within 3 minutes of the console's clock.
    - Commands it expects down the stream, in order: `HandoverResult`, then `LeafHash`/`RootHash` (a record-set
      sync), then steady state `PutRecord`/`DeleteRecord` (records such as `topic.subscription`). Errors:
      `ProtocolVersionError`, `TwinRecordParseError`.
@@ -23,7 +24,15 @@
      22 DeleteRequest, 23 SubscribeTopic, 24 Nack, 25 SubscriptionList, 26 ResendRequest, 27 DAPresence,
      28 SubscriptionListRequest, 29 MyAccountMessageRequest, 30 ReloadLink, 31 SubscriptionUpdated, 32 Hi,
      33 Onset, 34 PresenceNotifyRequest, 35 DenySubscribe, 36 TopicRead, 37 CrewNotifyRequest.
-   - Steady state accepts 4, 5, 9, 13, 16, 17, 20, 24, 25, 31, 32. Next: each table's fields and the framing.
+   - Steady state accepts 4, 5, 9, 13, 16, 17, 20, 24, 25, 31, 32.
+   - Framing: each message is a 4-byte little-endian length (non-zero, within the buffer) then a FlatBuffer.
+   - Root table: 0 command type (ubyte), 1 command (union), 2 string, 3 u64, 4 u64.
+   - Tables read so far (from the verifier, 0x4f754e2080): Hi and SyncComplete empty; HandoverResult {0: byte};
+     Ping {0,1,2: u64}; Pong {0: u64}; Idle {0: u16}. The other 32 are in the same function.
+   - A news push carries JSON bcat reads: `type`, `topic_id`, `wait_range`, `ha_wait_range_min/max`, `news_id`,
+     `notification_type`, `url`, `one2one`.
+   - Upstream (splatoon-3 `gateway.go`) only holds the stream open and sends nothing: no protocol to reuse.
+   - Next: the remaining tables, then the opening sequence (who speaks first, handover, hash sync).
 2. **Push**: the message that makes a console fetch now; bcat-nx sends it when a news file changes.
 3. **penne-nx**: move penne out of baas-jwks into its own server and repo (`nextendo-penne-nx`).
 - Known and answered: `notification_tokens`, `links`, `push_channels` (BaaS), `login_tickets`, `frontlines`.
