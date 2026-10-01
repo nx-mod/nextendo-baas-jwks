@@ -414,7 +414,18 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 		mu     sync.Mutex
 		body   bytes.Buffer
 		frames int
+		wmu    sync.Mutex // serialises writes to the stream (replies and keepalive Pings)
+		synced bool       // the console finished the record sync: Pings may start
+		pinged bool       // a Ping is unanswered: npns asserts on a second one before its Pong
 	)
+	send := func(b []byte) {
+		wmu.Lock()
+		defer wmu.Unlock()
+		w.Write(b)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -437,6 +448,7 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 			body.Write(msg)
 			frames++
 			first := frames == 1
+			os.WriteFile(name+".bin", body.Bytes(), 0o600) // after every message: a crash must not lose them
 			mu.Unlock()
 			log.Printf("[baas-jwks]     frontline <- message %d: type %d, %d bytes", frames, kind, n)
 			if kind == penneReset {
@@ -447,24 +459,55 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 			// SyncComplete there got a Reset). Experiment: an empty RootHash = nothing to compare. At most
 			// once per penneTryEvery, so a rejected reply cannot become a reconnect loop.
 			if first && kind == penneRootHash && penneMayTry() {
-				w.Write(penneRootHashEmpty)
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
+				send(penneRootHashEmpty)
 				log.Printf("[baas-jwks]     frontline -> RootHash with no sets")
 			}
-			// SubscribeTopic {1: flag, 2: list, 3: topic}: the console waits 10 s for an answer. NOT answered:
-			// an Ack carrying the topic crashed npns (it asserts when the Ack's string is not its pending key,
-			// and that key is not the topic). Log only, until the right reply is confirmed from npns' code.
+			switch kind {
+			case penneSyncComplete:
+				mu.Lock()
+				synced = true
+				mu.Unlock()
+			case pennePong:
+				mu.Lock()
+				pinged = false
+				mu.Unlock()
+			}
+			// SubscribeTopic {1: flag, 2: list, 3: topic}: the console waits 10 s for an Ack whose string is its
+			// pending key. For a topic subscription that key is the literal "topic.subscription" (npns
+			// 0x4f754dd980), not the topic: an Ack carrying the topic made npns assert and crash the console.
+			// Only ever answer a request just read (an Ack with nothing pending asserts too).
 			if kind == penneSubscribeTopic {
-				log.Printf("[baas-jwks]     frontline <- SubscribeTopic %s (not answered)", penneCommandString(msg, 3))
+				send(penneAckMessage(penneSubscribeKey))
+				log.Printf("[baas-jwks]     frontline <- SubscribeTopic %s -> Ack %q", penneCommandString(msg, 3), penneSubscribeKey)
 			}
 		}
 	}()
-	select {
-	case <-done:
-	case <-time.After(penneCaptureWindow):
-	case <-r.Context().Done():
+	// Keepalive: without traffic the console drops the stream after a few minutes. A Ping carries a value the
+	// console sends back in a Pong; never send a second Ping while one is unanswered.
+	tick := time.NewTicker(pennePingEvery)
+	defer tick.Stop()
+	end := time.After(penneCaptureWindow)
+wait:
+	for {
+		select {
+		case <-done:
+			break wait
+		case <-end:
+			break wait
+		case <-r.Context().Done():
+			break wait
+		case <-tick.C:
+			mu.Lock()
+			ok := synced && !pinged
+			if ok {
+				pinged = true
+			}
+			mu.Unlock()
+			if ok {
+				send(pennePingMessage(uint64(time.Now().UnixNano())))
+				log.Printf("[baas-jwks]     frontline -> Ping")
+			}
+		}
 	}
 	mu.Lock()
 	got := append([]byte(nil), body.Bytes()...)
@@ -480,10 +523,11 @@ const (
 	penneRootHash       = 6  // {0: [{0: record set name, 1: its 20-byte SHA-1}]}
 	penneSyncComplete   = 8  // {}
 	penneHandoverResult = 12 // {0: byte}: 0 or absent = the handover succeeded
-	penneCaptureWindow  = 120 * time.Second
+	penneCaptureWindow  = 15 * time.Minute
 )
 
 const (
+	penneAck            = 9  // {0: the pending key of the request it answers}
 	penneReset          = 13 // {0: u16, 1: u16, 2: text}: the console gives up, and says why
 	penneSubscribeTopic = 23 // {1: flag, 2: list, 3: topic}; its key is the topic
 	penneTryEvery       = 20 * time.Second
@@ -557,6 +601,57 @@ func penneResetText(b []byte) string {
 	s := cmd + u16(cvt+8)
 	s += u32(s)
 	return fmt.Sprintf("%s (codes %d/%d)", b[s+4:s+4+u32(s)], u16(cmd+u16(cvt+4)), u16(cmd+u16(cvt+6)))
+}
+
+const (
+	pennePing      = 16 // {0: u64}: the console answers with a Pong carrying the same value
+	pennePong      = 17 // {0: u64}
+	pennePingEvery = 30 * time.Second
+)
+
+// pennePingMessage is a framed Ping carrying v.
+func pennePingMessage(v uint64) []byte {
+	b := []byte{
+		48, 0, 0, 0, // frame: 48 bytes follow
+		12, 0, 0, 0, // root table at 12
+		8, 0, 12, 0, 8, 0, 4, 0, // root vtable: field 0 at +8, field 1 at +4
+		8, 0, 0, 0, // root table
+		16, 0, 0, 0, // field 1: the command table, 16 bytes on (at 32)
+		pennePing, 0, 0, 0, // field 0: the command type
+		6, 0, 16, 0, 8, 0, 0, 0, // command vtable: size 6, table 16 bytes, field 0 at +8 (then padding)
+		8, 0, 0, 0, // command table
+		0, 0, 0, 0, // padding: the u64 is 8-byte aligned in the buffer (at 40)
+		0, 0, 0, 0, 0, 0, 0, 0, // field 0: the value, set below
+	}
+	binary.LittleEndian.PutUint64(b[44:], v)
+	return b
+}
+
+// penneSubscribeKey is the pending key npns keeps for a SubscribeTopic request.
+const penneSubscribeKey = "topic.subscription"
+
+// penneAckMessage is a framed Ack for the request whose pending key is key.
+func penneAckMessage(key string) []byte {
+	str := append([]byte(key), 0)
+	for len(str)%4 != 0 {
+		str = append(str, 0)
+	}
+	b := []byte{
+		0, 0, 0, 0, // frame length, set below
+		12, 0, 0, 0, // root table at 12
+		8, 0, 12, 0, 8, 0, 4, 0, // root vtable: field 0 at +8, field 1 at +4
+		8, 0, 0, 0, // root table
+		16, 0, 0, 0, // field 1: the command table, 16 bytes on (at 32)
+		penneAck, 0, 0, 0, // field 0: the command type
+		6, 0, 8, 0, 4, 0, 0, 0, // command vtable: size 6, table 8 bytes, field 0 at +4 (then padding)
+		8, 0, 0, 0, // command table
+		4, 0, 0, 0, // field 0: the string, 4 bytes on
+		0, 0, 0, 0, // string length, set below
+	}
+	binary.LittleEndian.PutUint32(b[44:], uint32(len(key)))
+	b = append(b, str...)
+	binary.LittleEndian.PutUint32(b, uint32(len(b)-4))
+	return b
 }
 
 // penneKind is a message's command type (root field 0), 0 if it has none.
@@ -660,6 +755,9 @@ func pennePresence(w http.ResponseWriter, r *http.Request) bool {
 		return reply(http.StatusOK, map[string]any{"expires_at": now + 4*24*3600, "frontline_fqdn": penneFrontline,
 			"issued_at": now, "persistent_connection_params_simple": penneConnParams, "ticket": randHex(32)})
 	case strings.Contains(host, "penne") && r.Method == http.MethodGet && p == "/v1/frontlines" && penneFrontlineOn:
+		// The console reports how its last frontline attempt went.
+		log.Printf("[baas-jwks]     frontlines: X-Fro-Result=%q X-NPC=%q X-Login-Try=%q X-Tolerant=%q",
+			r.Header.Get("X-Fro-Result"), r.Header.Get("X-NPC"), r.Header.Get("X-Login-Try"), r.Header.Get("X-Tolerant"))
 		return reply(http.StatusOK, map[string]any{"current_time": now, "frontline_fqdn": penneFrontline,
 			"persistent_connection_params_simple": penneConnParams})
 	case strings.Contains(host, "penne") && r.Method == http.MethodPost && strings.HasPrefix(p, "/v1/accounts/") && strings.HasSuffix(p, "/links"):

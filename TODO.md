@@ -3,9 +3,8 @@
 ## In progress
 
 - **Linking an offline user, 2124-3121 after `PATCH users/<id>`**: PATCHes are now kept and echoed; retest.
-- **penne frontline: OFF** (`BAAS_PENNE_FRONTLINE=0`). A live session got through the handshake, then our `Ack` to
-  `SubscribeTopic` **crashed npns** on the console (2162-0002, title 010000000000002F). Do not turn it on again
-  until the crash report (sd:/atmosphere/crash_reports/*_010000000000002f.log) shows which assert fired.
+- **penne frontline: ON, a session holds** (`BAAS_PENNE_FRONTLINE=1`): handshake, record sync, topic subscriptions
+  and keepalive work against a console on 22.5.0. Not done: pushing a notification (below).
 
 ## Penne (push, firmware 18+; replaces NPNS)
 
@@ -60,7 +59,15 @@
      another stored string. **Not confirmed:** which kind sends message type 23 (SubscribeTopic); kind 2 is the
      likely one. No reply is sent until that is confirmed; an Ack with a wrong key always aborts npns.
    - A Reset from the console carries the reason as text: the best debugging aid in this protocol.
-   - Next: confirm the request kind behind SubscribeTopic (then its Ack key), then Ping/Pong to hold the stream.
+   - **Working session (2026-09-30):** [HandoverResult] -> RootHash; [RootHash, no sets] -> SyncComplete, then one
+     SubscribeTopic per topic (`nx_data_<title>`, `nx_news`, `nx_notice`, `nx_news_nextendo`), each answered
+     [Ack {0: "topic.subscription"}] (confirmed: four in a row accepted, so that is the key and SubscribeTopic is
+     request kind 2). Keepalive: [Ping {0: u64}] every 30 s -> console Pong {0: the same value}; npns asserts on
+     a second Ping before the Pong (0x4f754df880), so one at a time. Without traffic the console reconnects
+     after about 4.5 minutes; `GET /v1/frontlines` then reports `X-Fro-Result: 000-0000`.
+   - A server Pong is only valid as the answer to a Ping the console sent (0x4f754df9e0 asserts otherwise).
+   - Next: how a notification reaches the console (steady state accepts PutRecord, DeleteRecord, Ack, Reset,
+     Ping, Pong, Idle, Nack, SubscriptionList, SubscriptionUpdated, Hi), so bcat fetches a topic at once.
 2. **Push**: the message that makes a console fetch now; bcat-nx sends it when a news file changes.
 3. **penne-nx**: move penne out of baas-jwks into its own server and repo (`nextendo-penne-nx`).
 - Known and answered: `notification_tokens`, `links`, `push_channels` (BaaS), `login_tickets`, `frontlines`.

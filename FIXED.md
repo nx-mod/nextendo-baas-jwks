@@ -9,7 +9,8 @@
 - **Test Connection**: connection-test API (`/v1/ip`, `/v1/time`) in production's JSON.
 - **Users with a Nintendo Account couldn't be opened or deleted**: NSO membership (`capi.lp1.op2`) answered.
 - **vermillion calls 404**: `devices/initialize`, `vermillion-device-id`, `accounts/config`.
-- **Push reconnect loop / Settings hang**: penne login tickets off unless `BAAS_PENNE_FRONTLINE=1`.
+- **Push (penne) frontline**: a console now holds a session: HandoverResult, record sync, an Ack per topic
+  subscription, Ping/Pong keepalive (was: a 404 reconnect loop, then a hang when held open with nothing sent).
 - **User PATCH ignored**: `/nickname`, `/extras/self/nxAccount`, `/thumbnailUrl`... are kept
   (`baas_user_patches.json`) and in every user reply; `thumbnailUploadedAt` follows the uploaded image.
 - **Device tokens in the log**: `/token` requests are logged by field name only.
