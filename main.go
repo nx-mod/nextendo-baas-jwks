@@ -453,17 +453,11 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 				}
 				log.Printf("[baas-jwks]     frontline -> RootHash with no sets")
 			}
-			// SubscribeTopic {1: flag, 2: list, 3: topic}: the console keeps the topic as its pending key and
-			// waits 10 s for an Ack carrying it (npns asserts on an Ack whose string differs, or with nothing
-			// pending: only ever answer a request just read, with its own key).
+			// SubscribeTopic {1: flag, 2: list, 3: topic}: the console waits 10 s for an answer. NOT answered:
+			// an Ack carrying the topic crashed npns (it asserts when the Ack's string is not its pending key,
+			// and that key is not the topic). Log only, until the right reply is confirmed from npns' code.
 			if kind == penneSubscribeTopic {
-				if topic := penneCommandString(msg, 3); topic != "" {
-					w.Write(penneAckMessage(topic))
-					if f, ok := w.(http.Flusher); ok {
-						f.Flush()
-					}
-					log.Printf("[baas-jwks]     frontline <- SubscribeTopic %s -> Ack", topic)
-				}
+				log.Printf("[baas-jwks]     frontline <- SubscribeTopic %s (not answered)", penneCommandString(msg, 3))
 			}
 		}
 	}()
@@ -490,7 +484,6 @@ const (
 )
 
 const (
-	penneAck            = 9  // {0: the key of the request it answers}
 	penneReset          = 13 // {0: u16, 1: u16, 2: text}: the console gives up, and says why
 	penneSubscribeTopic = 23 // {1: flag, 2: list, 3: topic}; its key is the topic
 	penneTryEvery       = 20 * time.Second
@@ -516,30 +509,6 @@ func penneCommandString(b []byte, n int) (s string) {
 	p := cmd + u16(cvt+4+2*n)
 	p += u32(p)
 	return string(b[p+4 : p+4+u32(p)])
-}
-
-// penneAckMessage is a framed Ack for the request whose key is key.
-func penneAckMessage(key string) []byte {
-	str := append([]byte(key), 0)
-	for len(str)%4 != 0 {
-		str = append(str, 0)
-	}
-	b := []byte{
-		0, 0, 0, 0, // frame length, set below
-		12, 0, 0, 0, // root table at 12
-		8, 0, 12, 0, 8, 0, 4, 0, // root vtable: field 0 at +8, field 1 at +4
-		8, 0, 0, 0, // root table
-		16, 0, 0, 0, // field 1: the command table, 16 bytes on (at 32)
-		penneAck, 0, 0, 0, // field 0: the command type
-		6, 0, 8, 0, 4, 0, 0, 0, // command vtable: size 6, table 8 bytes, field 0 at +4 (then padding)
-		8, 0, 0, 0, // command table
-		4, 0, 0, 0, // field 0: the string, 4 bytes on
-		0, 0, 0, 0, // string length, set below
-	}
-	binary.LittleEndian.PutUint32(b[44:], uint32(len(key)))
-	b = append(b, str...)
-	binary.LittleEndian.PutUint32(b, uint32(len(b)-4))
-	return b
 }
 
 var (
