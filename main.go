@@ -370,10 +370,10 @@ const penneFrontline = "fro-1.hac.lp1.penne.srv.nintendo.net"
 // {"version":{"major":1,"minor":1,"micro":0},"online_license":{"is_available":true},"activity":{...},...}.
 const vermillionConfig = "eyJ2ZXJzaW9uIjp7Im1ham9yIjoxLCJtaW5vciI6MSwibWljcm8iOjB9LCJvbmxpbmVfbGljZW5zZSI6eyJpc19hdmFpbGFibGUiOnRydWV9LCJhY3Rpdml0eSI6eyJoYXNfcmVjZWl2ZWRfZ3VpZGFuY2UiOnRydWUsImhhc19pbnNlcnRlZCI6dHJ1ZSwiaGFzX3RyYW5zZmVycmVkX3RvX3ZwaHltIjp0cnVlfSwiZGlzYWJsZWRfY29udGVudCI6eyJjb250ZW50X21ldGFfaWRzIjpbXX0sImhpZGRlbl9rZXkiOnsiYXBwbGljYXRpb25faWRzIjpbXX19"
 
-// captureFrontline records the penne frontline push stream (fro-*.penne, a long-lived HTTP/2 POST /) to learn
-// its protocol: the request headers (secret-looking values masked) and what the console sends within
-// penneCaptureWindow, in BAAS_FRONTLINE_DIR/<time>.txt/.bin. It answers the first step (HandoverResult); the
-// stream then ends cleanly (held open with nothing sent, it hung System Settings).
+// captureFrontline serves the penne frontline push stream (fro-*.penne, a long-lived HTTP/2 POST /): the
+// handshake, the record sync, the topic subscriptions and the keepalive, for as long as the console keeps it
+// open. The request headers (secret-looking values masked) and the session's first messages are kept in
+// BAAS_FRONTLINE_DIR/<time>.txt/.bin. Pushing a notification is not done yet (TODO.md).
 func captureFrontline(w http.ResponseWriter, r *http.Request) {
 	dir := getenv("BAAS_FRONTLINE_DIR", "frontline")
 	os.MkdirAll(dir, 0o755)
@@ -444,13 +444,19 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 			}
 			kind := penneKind(msg)
 			mu.Lock()
-			body.Write(hdr[:])
-			body.Write(msg)
 			frames++
 			first := frames == 1
-			os.WriteFile(name+".bin", body.Bytes(), 0o600) // after every message: a crash must not lose them
+			// The first messages are kept on disk (written after each one: a crash must not lose them);
+			// a session lasts for hours, so not the keepalive Pongs that follow.
+			if body.Len() < penneCaptureBytes {
+				body.Write(hdr[:])
+				body.Write(msg)
+				os.WriteFile(name+".bin", body.Bytes(), 0o600)
+			}
 			mu.Unlock()
-			log.Printf("[baas-jwks]     frontline <- message %d: type %d, %d bytes", frames, kind, n)
+			if kind != pennePong {
+				log.Printf("[baas-jwks]     frontline <- message %d: type %d, %d bytes", frames, kind, n)
+			}
 			if kind == penneReset {
 				log.Printf("[baas-jwks]     frontline <- Reset: %s", penneResetText(msg))
 			}
@@ -486,13 +492,11 @@ func captureFrontline(w http.ResponseWriter, r *http.Request) {
 	// console sends back in a Pong; never send a second Ping while one is unanswered.
 	tick := time.NewTicker(pennePingEvery)
 	defer tick.Stop()
-	end := time.After(penneCaptureWindow)
+	started, pings := time.Now(), 0
 wait:
 	for {
 		select {
 		case <-done:
-			break wait
-		case <-end:
 			break wait
 		case <-r.Context().Done():
 			break wait
@@ -505,25 +509,26 @@ wait:
 			mu.Unlock()
 			if ok {
 				send(pennePingMessage(uint64(time.Now().UnixNano())))
-				log.Printf("[baas-jwks]     frontline -> Ping")
+				if pings++; pings == 1 {
+					log.Printf("[baas-jwks]     frontline -> Ping (then every %s, not logged)", pennePingEvery)
+				}
 			}
 		}
 	}
 	mu.Lock()
-	got := append([]byte(nil), body.Bytes()...)
 	n := frames
 	mu.Unlock()
-	os.WriteFile(name+".bin", got, 0o600)
-	log.Printf("[baas-jwks]     frontline stream: %d message(s), %d bytes from the console in %s", n, len(got), penneCaptureWindow)
+	log.Printf("[baas-jwks]     frontline stream ended after %s: %d message(s) from the console, %d Ping(s) sent",
+		time.Since(started).Round(time.Second), n, pings)
 }
 
 // Penne frontline messages (npns 22.5.0): a 4-byte little-endian length, then a FlatBuffer whose root table is
 // {0: command type (ubyte), 1: command (union table), 2: string, 3: u64, 4: u64}.
 const (
-	penneRootHash       = 6  // {0: [{0: record set name, 1: its 20-byte SHA-1}]}
-	penneSyncComplete   = 8  // {}
-	penneHandoverResult = 12 // {0: byte}: 0 or absent = the handover succeeded
-	penneCaptureWindow  = 15 * time.Minute
+	penneRootHash       = 6        // {0: [{0: record set name, 1: its 20-byte SHA-1}]}
+	penneSyncComplete   = 8        // {}
+	penneHandoverResult = 12       // {0: byte}: 0 or absent = the handover succeeded
+	penneCaptureBytes   = 64 << 10 // how much of a session is kept in BAAS_FRONTLINE_DIR
 )
 
 const (
