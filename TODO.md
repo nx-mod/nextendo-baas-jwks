@@ -66,8 +66,26 @@
      a second Ping before the Pong (0x4f754df880), so one at a time. Without traffic the console reconnects
      after about 4.5 minutes; `GET /v1/frontlines` then reports `X-Fro-Result: 000-0000`.
    - A server Pong is only valid as the answer to a Ping the console sent (0x4f754df9e0 asserts otherwise).
-   - Next: how a notification reaches the console (steady state accepts PutRecord, DeleteRecord, Ack, Reset,
-     Ping, Pong, Idle, Nack, SubscriptionList, SubscriptionUpdated, Hi), so bcat fetches a topic at once.
+   - **A notification is a PutRecord** (read from npns, NOT sent yet). Handler 0x4f754dfbb0 asserts:
+     - command field 0 is a list of **exactly one** record (anything else aborts npns);
+     - the record is {0: variant (u8), 1: object}; variant 1 = a message (0x4f754dc510), 2 = a stored key/value
+       (0x4f754dc430, key must pass 0x4f754afe70); any other variant aborts; a missing object is a null read;
+     - no second PutRecord before the console has acknowledged the first (flag +0x93a8; it answers with the
+       record's key, field 0 of the object).
+     Message object (parser 0x4f754d69f0; a bad one is logged and dropped, not asserted, but every field below
+     is read unconditionally, so all must be present):
+       0: id string (< 48 chars); for type 2 it is "<topic>-<rest>", the part before the dash (<= 39) is the topic
+       1: type (u16); 2 = topic message
+       2: destination table {1: comma-separated application ids ("0x..." hex or decimal), < 128 chars;
+          2: account id as 32 hex chars, or empty; 4: topic (<= 39 chars) for non-topic messages}
+       4: payload (< 4096 bytes): what the receiving program parses
+       5: time (u64, >= 0): delivery time; due ones are delivered at once, later ones queued by time
+   - **Payload bcat's news code accepts** (bcat 0x61119029b0): JSON `{"type":"news","topic_id":...,"wait_range":
+     n,"ha_wait_range_min":n,"ha_wait_range_max":n}` (fetch that channel; wait_range = random delay) or
+     `{"type":"news_pickup","url":...,"date":...,"one2one":...}`. bcat's data delivery (0x6111883c48) reads
+     `type`, `topic_id`, `revision`, `wait_range`.
+   - Next: which application ids the destination must name (how npns routes a delivered message to bcat:
+     0x4f754d6070 / 0x4f754d6250), then build the PutRecord and send one `news` push.
 2. **Push**: the message that makes a console fetch now; bcat-nx sends it when a news file changes.
 3. **penne-nx**: move penne out of baas-jwks into its own server and repo (`nextendo-penne-nx`).
 - Known and answered: `notification_tokens`, `links`, `push_channels` (BaaS), `login_tickets`, `frontlines`.
